@@ -16,8 +16,9 @@ def main():
     pool = AccountPool(GOFILE_TOKENS)
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
     
-    if BOT_API_BASE_URL:
-        builder = builder.base_url(BOT_API_BASE_URL)
+    if BOT_API_BASE_URL:  # only if non-empty
+        builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")
+    
     app = builder.build()
     app.bot_data["pool"] = pool
 

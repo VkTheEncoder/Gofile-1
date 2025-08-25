@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update
 from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
@@ -10,6 +11,13 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 log = logging.getLogger(__name__)
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Unhandled error while processing update: %s", update)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text("That file is large—trying another method…")
+
+app.add_error_handler(on_error)
 
 def main():
     pool = AccountPool(GOFILE_TOKENS)

@@ -76,13 +76,32 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
 
-    path = await _download_telegram_file(update, context)
+    # 1) Try normal Bot API download
+    path = None
+    try:
+        path = await _download_telegram_file(update, context)
+    except BadRequest as e:
+        if "File is too big" in str(e):
+            # 2) Fallback to Pyrogram (MTProto)
+            try:
+                path = await _download_via_pyrogram(update, DOWNLOAD_DIR)
+            except RPCError as e2:
+                await update.message.reply_text(f"Download failed via MTProto: {e2}")
+                return
+        else:
+            await update.message.reply_text(f"Download failed: {e}")
+            return
+
     if not path:
-        await update.message.reply_text("I couldn't find a file in your message.")
-        return
+        # Could be no media or another edge-case
+        # Try MTProto as last resort anyway
+        try:
+            path = await _download_via_pyrogram(update, DOWNLOAD_DIR)
+        except Exception as e:
+            await update.message.reply_text("I couldn't find a file in your message.")
+            return
 
     try:
-        # try accounts in rotation
         last_error = None
         for _ in range(len(pool.tokens)):
             idx, client = await pool.pick()

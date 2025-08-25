@@ -73,6 +73,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         txt.append("Usage fields not provided by API (free accounts expose limited info)." )
     await update.message.reply_text("\n".join(txt))
 
+async def _download_via_pyrogram(update, dest_dir: str) -> str | None:
+    """
+    Download the same incoming message's media via MTProto (Pyrogram).
+    Works for files too big for Bot API (up to ~2GB).
+    """
+    import os
+    os.makedirs(dest_dir, exist_ok=True)
+
+    chat_id = update.effective_chat.id
+    msg_id = update.effective_message.message_id
+
+    client = await get_client()
+    msg = await client.get_messages(chat_id, msg_id)
+    return await msg.download(file_name=dest_dir)
+
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pool: AccountPool = context.bot_data["pool"]
     chat = update.effective_chat

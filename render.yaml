@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: tg-gofile-rotator
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.webhook
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GOFILE_TOKENS
+        sync: false
+      - key: USE_WEBHOOK
+        value: "true"
+      - key: WEBHOOK_URL
+        sync: false

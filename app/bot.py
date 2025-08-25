@@ -15,29 +15,29 @@ log = logging.getLogger(__name__)
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.exception("Unhandled error while processing update: %s", update)
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("That file is large—trying another method…")
-
-app.add_error_handler(on_error)
+        await update.effective_message.reply_text("Something went wrong, but I’m still here!")
 
 def main():
     pool = AccountPool(GOFILE_TOKENS)
 
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
-    
-    if BOT_API_BASE_URL:  # only if non-empty
+
+    if BOT_API_BASE_URL:
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")
-    
+
     app = builder.build()
-    
     app.bot_data["pool"] = pool
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
-
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
         handle_incoming_file
     ))
+
+    # ✅ add the error handler AFTER app is created
+    app.add_error_handler(on_error)
 
     log.info("Starting bot in polling mode…")
     app.run_polling(close_loop=False)

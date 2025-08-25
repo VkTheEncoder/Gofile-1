@@ -20,7 +20,8 @@ def main():
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")
     
     app = builder.build()
-
+    
+    app.bot_data["pool"] = pool
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))

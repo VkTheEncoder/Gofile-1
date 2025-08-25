@@ -4,6 +4,9 @@ import logging
 import os
 import tempfile
 from typing import Optional, Tuple
+from telegram.error import BadRequest
+from .pyro_client import get_client
+from pyrogram.errors import RPCError
 
 from telegram import Update
 from telegram.constants import ChatAction

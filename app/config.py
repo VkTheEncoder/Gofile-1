@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+BOT_API_BASE_URL = os.getenv("BOT_API_BASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GOFILE_TOKENS = [t.strip() for t in os.getenv("GOFILE_TOKENS", "").split(",") if t.strip()]
 

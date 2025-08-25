@@ -15,8 +15,9 @@ log = logging.getLogger(__name__)
 def main():
     pool = AccountPool(GOFILE_TOKENS)
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    
     if BOT_API_BASE_URL:
-        builder = builder.base_url(BOT_API_BASE_URL).get_updates_http_version("2.0")
+        builder = builder.base_url(BOT_API_BASE_URL)
     app = builder.build()
     app.bot_data["pool"] = pool
 

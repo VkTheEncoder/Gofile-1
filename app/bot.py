@@ -2,6 +2,8 @@ from __future__ import annotations
 import logging
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
+from telegram.constants import MessageEntityType
+from app.handlers import start, help_cmd, stats, handle_incoming_file
 from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
@@ -28,6 +30,24 @@ def main():
     app = builder.build()
     app.bot_data["pool"] = pool
 
+    # 1) URL messages (text or captions) -> same handler
+    url_filter = (
+        (filters.TEXT & filters.Entity(MessageEntityType.URL)) |
+        (filters.TEXT & filters.Regex(r'https?://')) |
+        (filters.CAPTION & filters.CaptionEntity(MessageEntityType.URL)) |
+        (filters.CAPTION & filters.CaptionRegex(r'https?://'))
+    )
+    application.add_handler(MessageHandler(url_filter, handle_incoming_file))
+    
+    # 2) Files (document/video/audio/photo) -> same handler
+    file_filter = (
+        filters.Document.ALL |
+        filters.VIDEO |
+        filters.AUDIO |
+        filters.PHOTO
+    )
+    application.add_handler(MessageHandler(file_filter, handle_incoming_file))
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))

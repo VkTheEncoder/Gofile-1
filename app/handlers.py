@@ -47,10 +47,8 @@ def _fmt_speed(bytes_per_sec: float) -> str:
         return f"{bytes_per_sec/1024:.2f} KB/s"
     return f"{bytes_per_sec:.0f} B/s"
 
-def _ptb_progress_factory(status: _ThrottleEdit, start_time: float):
+def _ptb_progress_factory(status, start_time, loop):
     def _cb(current: int, total: int, *args):
-        # PTB calls this sync; schedule an async edit
-        import asyncio
         pct = (current/total*100) if total else 0.0
         elapsed = max(0.001, time.time() - start_time)
         spd = current / elapsed
@@ -60,13 +58,13 @@ def _ptb_progress_factory(status: _ThrottleEdit, start_time: float):
             f"{current/1024/1024:.2f}/{(total or 0)/1024/1024:.2f} MB\n"
             f"Speed: {_fmt_speed(spd)}"
         )
-        asyncio.get_running_loop().create_task(status.edit(text))
+        # schedule the edit on the main loop (thread-safe)
+        loop.call_soon_threadsafe(asyncio.create_task, status.edit(text))
     return _cb
 
 
-def _pyro_progress_factory(status: _ThrottleEdit, start_time: float):
+def _pyro_progress_factory(status, start_time, loop):
     def _cb(current: int, total: int):
-        import asyncio
         pct = (current/total*100) if total else 0.0
         elapsed = max(0.001, time.time() - start_time)
         spd = current / elapsed
@@ -76,9 +74,9 @@ def _pyro_progress_factory(status: _ThrottleEdit, start_time: float):
             f"{current/1024/1024:.2f}/{(total or 0)/1024/1024:.2f} MB\n"
             f"Speed: {_fmt_speed(spd)}"
         )
-        asyncio.get_running_loop().create_task(status.edit(text))
+        # schedule the edit on the main loop (thread-safe)
+        loop.call_soon_threadsafe(asyncio.create_task, status.edit(text))
     return _cb
-
 
 
 async def _download_telegram_file(update, context, status) -> str | None:
@@ -105,9 +103,10 @@ async def _download_telegram_file(update, context, status) -> str | None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     dest = os.path.join(DOWNLOAD_DIR, filename)
     start = time.time()
+    loop = asyncio.get_running_loop()
     await file.download_to_drive(
         custom_path=dest,
-        progress=_ptb_progress_factory(status, start),
+        progress=_ptb_progress_factory(status, start, loop),
         progress_args=()
     )
     return dest
@@ -149,11 +148,13 @@ async def _download_via_pyrogram(update, dest_dir: str, status: _ThrottleEdit) -
     m = await client.get_messages(chat_id, msg_id)
 
     start = time.time()
+    loop = asyncio.get_running_loop()
     return await m.download(
         file_name=dest_dir,
-        progress=_pyro_progress_factory(status, start),
+        progress=_pyro_progress_factory(status, start, loop),
         progress_args=()
     )
+
 
 
 async def handle_incoming_file(update, context):

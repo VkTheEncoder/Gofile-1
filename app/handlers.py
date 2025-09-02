@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 from telegram.error import BadRequest
 from .pyro_client import get_client
 from pyrogram.errors import RPCError
+import time
+
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -17,8 +19,69 @@ from .gofile_api import GofileClient
 
 log = logging.getLogger(__name__)
 
-async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
-    """Download incoming file to temp disk and return path."""
+class _ThrottleEdit:
+    """Edit a Telegram message at most once per `interval` seconds."""
+    def __init__(self, msg, interval=1.0):
+        self.msg = msg
+        self.interval = interval
+        self._last = 0.0
+
+    async def edit(self, text: str):
+        now = time.time()
+        if now - self._last >= self.interval:
+            self._last = now
+            try:
+                await self.msg.edit_text(text)
+            except Exception:
+                pass
+
+def _bar(pct: float, width: int = 12) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(pct / (100/width))
+    return "█"*filled + "░"*(width-filled)
+
+def _fmt_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec >= 1024**2:
+        return f"{bytes_per_sec/1024**2:.2f} MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec/1024:.2f} KB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+def _ptb_progress_factory(status: _ThrottleEdit, start_time: float):
+    def _cb(current: int, total: int, *args):
+        # PTB calls this sync; schedule an async edit
+        import asyncio
+        pct = (current/total*100) if total else 0.0
+        elapsed = max(0.001, time.time() - start_time)
+        spd = current / elapsed
+        text = (
+            "⬇️ Downloading (Bot API)\n"
+            f"[{_bar(pct)}] {pct:.1f}%\n"
+            f"{current/1024/1024:.2f}/{(total or 0)/1024/1024:.2f} MB\n"
+            f"Speed: {_fmt_speed(spd)}"
+        )
+        asyncio.get_running_loop().create_task(status.edit(text))
+    return _cb
+
+
+def _pyro_progress_factory(status: _ThrottleEdit, start_time: float):
+    def _cb(current: int, total: int):
+        import asyncio
+        pct = (current/total*100) if total else 0.0
+        elapsed = max(0.001, time.time() - start_time)
+        spd = current / elapsed
+        text = (
+            "⬇️ Downloading (MTProto)\n"
+            f"[{_bar(pct)}] {pct:.1f}%\n"
+            f"{current/1024/1024:.2f}/{(total or 0)/1024/1024:.2f} MB\n"
+            f"Speed: {_fmt_speed(spd)}"
+        )
+        asyncio.get_running_loop().create_task(status.edit(text))
+    return _cb
+
+
+
+async def _download_telegram_file(update, context, status) -> str | None:
     msg = update.effective_message
     file = None
     filename = None
@@ -33,7 +96,6 @@ async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_
         file = await msg.audio.get_file()
         filename = msg.audio.file_name or "audio.bin"
     elif msg.photo:
-        # largest size
         photo = msg.photo[-1]
         file = await photo.get_file()
         filename = f"photo_{photo.file_unique_id}.jpg"
@@ -42,7 +104,12 @@ async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     dest = os.path.join(DOWNLOAD_DIR, filename)
-    await file.download_to_drive(custom_path=dest)
+    start = time.time()
+    await file.download_to_drive(
+        custom_path=dest,
+        progress=_ptb_progress_factory(status, start),
+        progress_args=()
+    )
     return dest
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -73,74 +140,73 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         txt.append("Usage fields not provided by API (free accounts expose limited info)." )
     await update.message.reply_text("\n".join(txt))
 
-async def _download_via_pyrogram(update, dest_dir: str) -> str | None:
-    """
-    Download the same incoming message's media via MTProto (Pyrogram).
-    Works for files too big for Bot API (up to ~2GB).
-    """
-    import os
+async def _download_via_pyrogram(update, dest_dir: str, status: _ThrottleEdit) -> str | None:
     os.makedirs(dest_dir, exist_ok=True)
-
     chat_id = update.effective_chat.id
     msg_id = update.effective_message.message_id
 
     client = await get_client()
-    msg = await client.get_messages(chat_id, msg_id)
-    return await msg.download(file_name=dest_dir)
+    m = await client.get_messages(chat_id, msg_id)
 
-async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    start = time.time()
+    return await m.download(
+        file_name=dest_dir,
+        progress=_pyro_progress_factory(status, start),
+        progress_args=()
+    )
+
+
+async def handle_incoming_file(update, context):
     pool: AccountPool = context.bot_data["pool"]
     chat = update.effective_chat
 
-    await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
+    # one status message we keep editing
+    status_msg = await update.effective_message.reply_text("Starting…")
+    status = _ThrottleEdit(status_msg, interval=1.0)
 
-    # 1) Try normal Bot API download
-    path = None
+    # Try Bot API first
     try:
-        path = await _download_telegram_file(update, context)
+        path = await _download_telegram_file(update, context, status)
     except BadRequest as e:
         if "File is too big" in str(e):
-            # 2) Fallback to Pyrogram (MTProto)
+            # MTProto fallback
             try:
-                path = await _download_via_pyrogram(update, DOWNLOAD_DIR)
+                path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
             except RPCError as e2:
-                await update.message.reply_text(f"Download failed via MTProto: {e2}")
+                await status.edit(f"❌ Download failed via MTProto: {e2}")
                 return
         else:
-            await update.message.reply_text(f"Download failed: {e}")
+            await status.edit(f"❌ Download failed: {e}")
             return
 
     if not path:
-        # Could be no media or another edge-case
-        # Try MTProto as last resort anyway
+        # last resort try MTProto
         try:
-            path = await _download_via_pyrogram(update, DOWNLOAD_DIR)
-        except Exception as e:
-            await update.message.reply_text("I couldn't find a file in your message.")
+            path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
+        except Exception:
+            await status.edit("❌ I couldn't find a file in your message.")
             return
 
     try:
+        await status.edit("⬆️ Uploading to GoFile…")
         last_error = None
         for _ in range(len(pool.tokens)):
             idx, client = await pool.pick()
             log.info("Using token index %s for upload", idx)
             async with client as c:
-                result = await c.upload_file(path)
+                # pass status to show upload progress
+                result = await c.upload_file(path, progress_status=status)
             if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
                 dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
                 content_id = result.get("contentId") or result.get("id")
-                message = ["✅ Uploaded to GoFile!"]
-                if dl:
-                    message.append(f"Link: {dl}")
-                if content_id:
-                    message.append(f"Content ID: {content_id}")
-                await update.message.reply_text("\n".join(message))
+                text = "✅ Uploaded to GoFile!\n"
+                if dl: text += f"Link: {dl}\n"
+                if content_id: text += f"Content ID: {content_id}"
+                await status.edit(text)
                 break
-            else:
-                last_error = result
-                await pool.mark_exhausted(idx)
         else:
-            await update.message.reply_text("All GoFile accounts appear exhausted or failed to upload.")
+            await status.edit("❌ All GoFile accounts appear exhausted or failed to upload.")
+
     finally:
         try:
             os.remove(path)

@@ -9,7 +9,8 @@ from .pyro_client import get_client
 from pyrogram.errors import RPCError
 import time
 
-
+from app.http_downloader import http_download
+import re
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
@@ -18,7 +19,7 @@ from .account_pool import AccountPool
 from .gofile_api import GofileClient
 
 log = logging.getLogger(__name__)
-
+_URL_RE = re.compile(r'(https?://\S+)', re.I)
 class _ThrottleEdit:
     """Edit a Telegram message at most once per `interval` seconds."""
     def __init__(self, msg, interval=1.0):
@@ -159,44 +160,57 @@ async def _download_via_pyrogram(update, dest_dir: str, status: _ThrottleEdit) -
 
 async def handle_incoming_file(update, context):
     pool: AccountPool = context.bot_data["pool"]
-    chat = update.effective_chat
 
     # one status message we keep editing
     status_msg = await update.effective_message.reply_text("Starting…")
     status = _ThrottleEdit(status_msg, interval=1.0)
 
-    # Try Bot API first
-    try:
-        path = await _download_telegram_file(update, context, status)
-    except BadRequest as e:
-        if "File is too big" in str(e):
-            # MTProto fallback
+    # ---------- NEW: URL-first branch ----------
+    # If user sent a link (in text or caption), download it directly at full speed.
+    msg = update.effective_message
+    text = (msg.text or "") + " " + (msg.caption or "")
+    m = _URL_RE.search(text)
+    if m:
+        url = m.group(1)
+        try:
+            await status.edit("⬇️ Downloading from URL…")
+            path = await http_download(url, dest_dir=DOWNLOAD_DIR, status=status)
+        except Exception as e:
+            await status.edit(f"❌ URL download failed: {type(e).__name__}: {e}")
+            return
+    else:
+        # ---------- Existing Telegram download path ----------
+        try:
+            path = await _download_telegram_file(update, context, status)
+        except BadRequest as e:
+            if "File is too big" in str(e):
+                # MTProto fallback
+                try:
+                    path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
+                except RPCError as e2:
+                    await status.edit(f"❌ Download failed via MTProto: {e2}")
+                    return
+            else:
+                await status.edit(f"❌ Download failed: {e}")
+                return
+
+        if not path:
+            # last resort try MTProto
             try:
                 path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
-            except RPCError as e2:
-                await status.edit(f"❌ Download failed via MTProto: {e2}")
+            except Exception:
+                await status.edit("❌ I couldn't find a file in your message.")
                 return
-        else:
-            await status.edit(f"❌ Download failed: {e}")
-            return
 
-    if not path:
-        # last resort try MTProto
-        try:
-            path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
-        except Exception:
-            await status.edit("❌ I couldn't find a file in your message.")
-            return
-
+    # ---------- Upload to GoFile ----------
     try:
         await status.edit("⬆️ Uploading to GoFile…")
-        last_error = None
         for _ in range(len(pool.tokens)):
             idx, client = await pool.pick()
             log.info("Using token index %s for upload", idx)
             async with client as c:
-                # pass status to show upload progress
                 result = await c.upload_file(path, progress_status=status)
+
             if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
                 dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
                 content_id = result.get("contentId") or result.get("id")
@@ -207,7 +221,6 @@ async def handle_incoming_file(update, context):
                 break
         else:
             await status.edit("❌ All GoFile accounts appear exhausted or failed to upload.")
-
     finally:
         try:
             os.remove(path)

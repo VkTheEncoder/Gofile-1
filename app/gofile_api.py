@@ -90,6 +90,46 @@ class GofileClient:
             return None
         return (used / limit) >= threshold
 
+    async def upload_file(
+        self,
+        file_path: str,
+        folder_id: Optional[str] = None,
+        progress_status=None
+    ) -> Dict[str, Any]:
+        params = {}
+        if folder_id:
+            params["folderId"] = folder_id
+
+        # progress callback (optional UI updates)
+        last = {"t": time.time(), "sent": 0}
+        def on_chunk(n: int):
+            last["sent"] += n
+            if progress_status:
+                now = time.time()
+                if now - last["t"] >= 1:
+                    try:
+                        size = os.path.getsize(file_path)
+                        pct = (last["sent"] / size) * 100 if size else 0.0
+                        asyncio.create_task(progress_status.edit(
+                            f"⬆️ Uploading… {pct:.1f}%"
+                        ))
+                    except Exception:
+                        pass
+                    last["t"] = now
+
+        mp = MultipartWriter("form-data")
+        # safer: wrap async iterator for aiohttp payload
+        mp.append(payload.AsyncIterablePayload(_iter_file(file_path, 1024*1024, on_chunk)),
+                  {"Content-Disposition": f'form-data; name="file"; filename="{os.path.basename(file_path)}"'})
+
+        async with self.session.post(UPLOAD_URL, data=mp, params=params, headers=self._headers()) as resp:
+            j = await resp.json(content_type=None)
+            if resp.status != 200:
+                return {"error": True, "status": resp.status, "response": j}
+            if isinstance(j, dict) and "data" in j:
+                return j["data"]
+            return j if isinstance(j, dict) else {"raw": j}
+
 async def upload_file(self, file_path: str, folder_id: Optional[str] = None, progress_status=None) -> Dict[str, Any]:
     params = {}
     if folder_id:

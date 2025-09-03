@@ -10,6 +10,7 @@ from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_U
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
 import asyncio
+from telegram import LinkPreviewOptions
 
 # --- logging ---
 logging.basicConfig(
@@ -33,8 +34,17 @@ def main():
     # 1) Build application
     pool = AccountPool(GOFILE_TOKENS)
 
-    defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults)
+    defaults = Defaults(
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),  # NEW
+    )
+    
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .defaults(defaults)
+        .build()
+    )
     if BOT_API_BASE_URL:
         # Ensure trailing slash for PTB custom Bot API base URL
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")

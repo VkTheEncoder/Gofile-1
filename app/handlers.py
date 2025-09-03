@@ -20,6 +20,11 @@ from .gofile_api import GofileClient
 
 log = logging.getLogger(__name__)
 _URL_RE = re.compile(r'(https?://\S+)', re.I)
+def _extract_urls(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return _URL_RE.findall(text.strip())
+
 class _ThrottleEdit:
     """Edit a Telegram message at most once per `interval` seconds."""
     def __init__(self, msg, interval=1.0):
@@ -157,29 +162,51 @@ async def _download_via_pyrogram(update, dest_dir: str, status: _ThrottleEdit) -
     )
 
 
-
-async def handle_incoming_file(update, context):
-    pool: AccountPool = context.bot_data["pool"]
-
-    # one status message we keep editing
-    status_msg = await update.effective_message.reply_text("Starting…")
-    status = _ThrottleEdit(status_msg, interval=1.0)
-
-    # ---------- NEW: URL-first branch ----------
-    # If user sent a link (in text or caption), download it directly at full speed.
-    msg = update.effective_message
-    text = (msg.text or "") + " " + (msg.caption or "")
-    m = _URL_RE.search(text)
-    if m:
-        url = m.group(1)
+async def _process_http_url(url: str, update, context):
+    # one concurrent slot for this whole download+upload
+    sem = context.bot_data["sem"]
+    async with sem:
+        status_msg = await update.effective_message.reply_text(f"Starting URL:\n{url}")
+        status = _ThrottleEdit(status_msg, interval=1.0)
         try:
             await status.edit("⬇️ Downloading from URL…")
             path = await http_download(url, dest_dir=DOWNLOAD_DIR, status=status)
         except Exception as e:
             await status.edit(f"❌ URL download failed: {type(e).__name__}: {e}")
             return
-    else:
-        # ---------- Existing Telegram download path ----------
+
+        pool: AccountPool = context.bot_data["pool"]
+        try:
+            await status.edit("⬆️ Uploading to GoFile…")
+            for _ in range(len(pool.tokens)):
+                idx, client = await pool.pick()
+                log.info("Using token index %s for upload (URL)", idx)
+                async with client as c:
+                    result = await c.upload_file(path, progress_status=status)
+                if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
+                    dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
+                    content_id = result.get("contentId") or result.get("id")
+                    text = "✅ Uploaded to GoFile!\n"
+                    if dl: text += f"Link: {dl}\n"
+                    if content_id: text += f"Content ID: {content_id}"
+                    await status.edit(text)
+                    break
+                else:
+                    await pool.mark_exhausted(idx)
+            else:
+                await status.edit("❌ All GoFile accounts appear exhausted or failed to upload.")
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+
+
+async def _process_telegram_media(update, context):
+    sem = context.bot_data["sem"]
+    async with sem:
+        status_msg = await update.effective_message.reply_text("Starting…")
+        status = _ThrottleEdit(status_msg, interval=1.0)
+
+        # Try Bot API first
         try:
             path = await _download_telegram_file(update, context, status)
         except BadRequest as e:
@@ -202,27 +229,44 @@ async def handle_incoming_file(update, context):
                 await status.edit("❌ I couldn't find a file in your message.")
                 return
 
-    # ---------- Upload to GoFile ----------
-    try:
-        await status.edit("⬆️ Uploading to GoFile…")
-        for _ in range(len(pool.tokens)):
-            idx, client = await pool.pick()
-            log.info("Using token index %s for upload", idx)
-            async with client as c:
-                result = await c.upload_file(path, progress_status=status)
-
-            if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
-                dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
-                content_id = result.get("contentId") or result.get("id")
-                text = "✅ Uploaded to GoFile!\n"
-                if dl: text += f"Link: {dl}\n"
-                if content_id: text += f"Content ID: {content_id}"
-                await status.edit(text)
-                break
-        else:
-            await status.edit("❌ All GoFile accounts appear exhausted or failed to upload.")
-    finally:
+        pool: AccountPool = context.bot_data["pool"]
         try:
-            os.remove(path)
-        except Exception:
-            pass
+            await status.edit("⬆️ Uploading to GoFile…")
+            for _ in range(len(pool.tokens)):
+                idx, client = await pool.pick()
+                log.info("Using token index %s for upload (TG)", idx)
+                async with client as c:
+                    result = await c.upload_file(path, progress_status=status)
+                if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
+                    dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
+                    content_id = result.get("contentId") or result.get("id")
+                    text = "✅ Uploaded to GoFile!\n"
+                    if dl: text += f"Link: {dl}\n"
+                    if content_id: text += f"Content ID: {content_id}"
+                    await status.edit(text)
+                    break
+                else:
+                    await pool.mark_exhausted(idx)
+            else:
+                await status.edit("❌ All GoFile accounts appear exhausted or failed to upload.")
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+
+
+async def handle_incoming_file(update, context):
+    # Gather ALL urls from text + caption
+    msg = update.effective_message
+    urls = _extract_urls((msg.text or "")) + _extract_urls((msg.caption or ""))
+
+    if urls:
+        # Spawn one task per URL (parallel; limited by semaphore)
+        for url in urls:
+            asyncio.create_task(_process_http_url(url, update, context))
+        # Acknowledge and return immediately (don’t block the handler)
+        await msg.reply_text(f"Queued {len(urls)} URL(s) for processing…")
+        return
+
+    # No URLs: treat the incoming message as Telegram media
+    # Spawn as a task so handler returns immediately
+    asyncio.create_task(_process_telegram_media(update, context))

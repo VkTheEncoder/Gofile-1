@@ -36,9 +36,9 @@ class _ThrottleEdit:
         self.interval = interval
         self._last = 0.0
 
-    async def edit(self, text: str):
+    async def edit(self, text: str, force: bool = False):
         now = time.time()
-        if now - self._last >= self.interval:
+        if force or now - self._last >= self.interval:
             self._last = now
             try:
                 await self.msg.edit_text(
@@ -47,6 +47,7 @@ class _ThrottleEdit:
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception:
+                # We don't want a failed UI edit to crash the flow
                 pass
 
 def _fmt_speed(bytes_per_sec: float) -> str:
@@ -232,7 +233,7 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                     async with client as c:
                         result = await c.upload_file(path, progress_status=status)
                 except Exception as e:
-                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"))
+                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"), force=True)
                     return
 
                 dl, content_id = _extract_gofile_result(result)
@@ -244,8 +245,10 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                         size_mb = 0.0
                     await status.edit(
                         M.upload_success(filename, size_mb, dl)
-                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""),
+                        force=True,
                     )
+
                     break
                 else:
                     if isinstance(result, dict) and result.get("error"):
@@ -253,7 +256,7 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                         return
                     await pool.mark_exhausted(idx)
             else:
-                await status.edit(M.all_exhausted())
+                await status.edit(M.all_exhausted(), force=True)
         finally:
             try:
                 if path:
@@ -298,7 +301,7 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                     async with client as c:
                         result = await c.upload_file(path, progress_status=status)
                 except Exception as e:
-                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"))
+                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"), force=True)
                     return
 
                 dl, content_id = _extract_gofile_result(result)
@@ -310,8 +313,10 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                         size_mb = 0.0
                     await status.edit(
                         M.upload_success(filename, size_mb, dl)
-                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""),
+                        force=True,
                     )
+
                     break
                 else:
                     if isinstance(result, dict) and result.get("error"):
@@ -319,7 +324,8 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                         return
                     await pool.mark_exhausted(idx)
             else:
-                await status.edit(M.all_exhausted())
+                await status.edit(M.all_exhausted(), force=True)
+
         finally:
             try:
                 if path:

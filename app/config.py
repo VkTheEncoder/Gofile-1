@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MAX_CONCURRENT_TRANSFERS = int(os.getenv("MAX_CONCURRENT_TRANSFERS", "3"))  # tune as you like
+MAX_CONCURRENT_TRANSFERS = int(os.getenv("MAX_CONCURRENT_TRANSFERS", "5"))  # tune as you like
 BOT_API_BASE_URL = os.getenv("BOT_API_BASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GOFILE_TOKENS = [t.strip() for t in os.getenv("GOFILE_TOKENS", "").split(",") if t.strip()]

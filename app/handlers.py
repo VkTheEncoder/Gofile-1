@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from telegram import LinkPreviewOptions
 import asyncio
 import logging
 import os
@@ -8,7 +8,7 @@ import mimetypes
 import re
 from pathlib import Path
 from html import escape
-
+from telegram.constants import ParseMode
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -33,7 +33,6 @@ def _extract_urls(text: str | None) -> list[str]:
 
 
 class _ThrottleEdit:
-    """Edit a Telegram message at most once per `interval` seconds."""
     def __init__(self, msg, interval: float = 1.0):
         self.msg = msg
         self.interval = interval
@@ -47,11 +46,10 @@ class _ThrottleEdit:
                 await self.msg.edit_text(
                     text,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),  # NEW
                 )
             except Exception:
                 pass
-
 
 def _bar(pct: float, width: int = 12) -> str:
     pct = max(0.0, min(100.0, pct))

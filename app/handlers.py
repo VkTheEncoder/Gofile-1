@@ -16,23 +16,19 @@ from pyrogram.errors import RPCError
 
 from . import messages as M
 from .pyro_client import get_client
-# ⬇️ REPLACED: use our robust downloader instead of app.http_downloader
 from .netutils import smart_download, pick_filename_for_url, sanitize_filename
-# ⬇️ import BOT_API_BASE_URL + TELEGRAM_BOT_TOKEN so we can build TG file URLs
 from .config import DOWNLOAD_DIR, BOT_API_BASE_URL, TELEGRAM_BOT_TOKEN
 from .account_pool import AccountPool
-from .gofile_api import GofileClient  # kept for type/context clarity
+from .gofile_api import GofileClient  # type clarity
 
 log = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r'(https?://\S+)', re.I)
 
-
 def _extract_urls(text: str | None) -> list[str]:
     if not text:
         return []
     return _URL_RE.findall(text.strip())
-
 
 class _ThrottleEdit:
     def __init__(self, msg, interval: float = 1.0):
@@ -53,13 +49,6 @@ class _ThrottleEdit:
             except Exception:
                 pass
 
-
-def _bar(pct: float, width: int = 12) -> str:
-    pct = max(0.0, min(100.0, pct))
-    filled = int(pct / (100 / width))
-    return "█" * filled + "░" * (width - filled)
-
-
 def _fmt_speed(bytes_per_sec: float) -> str:
     if bytes_per_sec >= 1024**2:
         return f"{bytes_per_sec/1024**2:.2f} MB/s"
@@ -67,10 +56,7 @@ def _fmt_speed(bytes_per_sec: float) -> str:
         return f"{bytes_per_sec/1024:.2f} KB/s"
     return f"{bytes_per_sec:.0f} B/s"
 
-
 def _ptb_progress_factory(status: _ThrottleEdit, start_time: float, loop):
-    # NOTE: kept for legacy PTB download progress; our new HTTP downloader
-    # does internal retries/resume and does not call this.
     def _cb(current: int, total: int, *args):
         pct = (current / total * 100) if total else 0.0
         elapsed = max(0.001, time.time() - start_time)
@@ -84,7 +70,6 @@ def _ptb_progress_factory(status: _ThrottleEdit, start_time: float, loop):
         text = M.downloading_via_botapi(progress)
         loop.call_soon_threadsafe(asyncio.create_task, status.edit(text))
     return _cb
-
 
 def _pyro_progress_factory(status: _ThrottleEdit, start_time: float, loop):
     def _cb(current: int, total: int):
@@ -101,12 +86,9 @@ def _pyro_progress_factory(status: _ThrottleEdit, start_time: float, loop):
         loop.call_soon_threadsafe(asyncio.create_task, status.edit(text))
     return _cb
 
-
 async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_TYPE, status: _ThrottleEdit) -> str | None:
     """
-    Bot API path, but using a robust HTTP downloader (HTTP/2 + ranges + resume)
-    instead of PTB's small-chunk writer. This fixes truncated payload errors and
-    usually increases throughput.
+    Bot API path, but using a robust HTTP downloader (HTTP/2 + ranges + resume).
     """
     msg = update.effective_message
     tfile = None
@@ -131,8 +113,6 @@ async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     dest = os.path.join(DOWNLOAD_DIR, filename)
 
-    # Build the absolute Telegram file URL and let smart_download handle it.
-    # Works both with public API and local Bot API server.
     base = (BOT_API_BASE_URL or "https://api.telegram.org").rstrip("/")
     file_url = f"{base}/file/bot{TELEGRAM_BOT_TOKEN}/{tfile.file_path}"
 
@@ -140,18 +120,14 @@ async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_
     await smart_download(file_url, dest)
     return dest
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(M.start())
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(M.help_text())
 
-
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pool: AccountPool = context.bot_data["pool"]
-    # Peek the first account’s usage (best effort)
     idx, client = await pool.pick()
     async with client as c:
         acc_id = await c.get_account_id()
@@ -161,7 +137,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     used_gb = (used / gb) if (used is not None) else None
     limit_gb = (limit / gb) if (limit is not None) else None
     await update.message.reply_text(M.stats_header(idx, acc_id, used_gb, limit_gb))
-
 
 def _guess_filename_from_msg(m) -> str:
     for attr in ("document", "video", "audio", "voice", "photo", "animation", "video_note"):
@@ -179,13 +154,10 @@ def _guess_filename_from_msg(m) -> str:
         ext = mimetypes.guess_extension(mt) or ""
     return f"{m.id}{ext or '.bin'}"
 
-
 async def _download_via_pyrogram(update: Update, dest_dir: str, status: _ThrottleEdit) -> str | None:
     os.makedirs(dest_dir, exist_ok=True)
-
     chat_id = update.effective_chat.id
     msg_id = update.effective_message.message_id
-
     client = await get_client()
     m = await client.get_messages(chat_id, msg_id)
 
@@ -195,16 +167,24 @@ async def _download_via_pyrogram(update: Update, dest_dir: str, status: _Throttl
         filename = f"{m.id}.bin"
 
     full_path = str(Path(dest_dir) / filename)
-
     start = time.time()
     loop = asyncio.get_running_loop()
-    # Pyrogram does its own chunking; keep its progress UI
     return await m.download(
         file_name=full_path,
         progress=_pyro_progress_factory(status, start, loop),
         progress_args=()
     )
 
+def _extract_gofile_result(result: dict) -> tuple[str | None, str | None]:
+    """
+    Return (download_link, content_id) from any GoFile shape.
+    """
+    if not isinstance(result, dict):
+        return None, None
+    data = result.get("data", result)
+    link = data.get("downloadPage") or data.get("downloadUrl") or data.get("page") or result.get("downloadPage")
+    cid  = data.get("contentId") or data.get("fileId") or data.get("id") or data.get("code") or result.get("contentId")
+    return link, cid
 
 async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     sem = context.bot_data["sem"]
@@ -214,12 +194,9 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
         path = None
         try:
             await status.edit(M.url_downloading())
-
-            # ⬇️ choose a good, human filename
             fname = await pick_filename_for_url(url, default="download.bin")
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
             path = os.path.join(DOWNLOAD_DIR, fname)
-
             await smart_download(url, path)
         except Exception as e:
             await status.edit(M.error("URL download", f"{type(e).__name__}: {e}"))
@@ -233,22 +210,23 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                 log.info("Using token index %s for upload (URL)", idx)
                 async with client as c:
                     result = await c.upload_file(path, progress_status=status)
-                if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
-                    dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
-                    content_id = result.get("contentId") or result.get("id")
 
+                dl, content_id = _extract_gofile_result(result)
+                if dl:
                     filename = os.path.basename(path)
                     try:
                         size_mb = os.path.getsize(path) / (1024**2)
                     except Exception:
                         size_mb = 0.0
-                    link = dl or ""
                     await status.edit(
-                        M.upload_success(filename, size_mb, link)
+                        M.upload_success(filename, size_mb, dl)
                         + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
                     )
                     break
                 else:
+                    if isinstance(result, dict) and result.get("error"):
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:400])}"))
+                        break
                     await pool.mark_exhausted(idx)
             else:
                 await status.edit(M.all_exhausted())
@@ -259,7 +237,6 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
             except Exception:
                 pass
 
-
 async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sem = context.bot_data["sem"]
     async with sem:
@@ -267,7 +244,6 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
         status = _ThrottleEdit(status_msg, interval=1.0)
 
         path = None
-        # Try Bot API (now robust) first
         try:
             path = await _download_telegram_file(update, context, status)
         except BadRequest as e:
@@ -282,7 +258,6 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                 return
 
         if not path:
-            # last resort try MTProto
             try:
                 path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
             except Exception:
@@ -297,19 +272,23 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                 log.info("Using token index %s for upload (TG)", idx)
                 async with client as c:
                     result = await c.upload_file(path, progress_status=status)
-                if result and isinstance(result, dict) and ("downloadPage" in result or "contentId" in result):
-                    dl = result.get("downloadPage") or result.get("downloadUrl") or result.get("page")
-                    content_id = result.get("contentId") or result.get("id")
 
+                dl, content_id = _extract_gofile_result(result)
+                if dl:
                     filename = os.path.basename(path)
                     try:
                         size_mb = os.path.getsize(path) / (1024**2)
                     except Exception:
                         size_mb = 0.0
-                    link = dl or ""
-                    await status.edit(M.upload_success(filename, size_mb, link) + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""))
+                    await status.edit(
+                        M.upload_success(filename, size_mb, dl)
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                    )
                     break
                 else:
+                    if isinstance(result, dict) and result.get("error"):
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:400])}"))
+                        break
                     await pool.mark_exhausted(idx)
             else:
                 await status.edit(M.all_exhausted())
@@ -320,9 +299,7 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
             except Exception:
                 pass
 
-
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Gather ALL urls from text + caption
     msg = update.effective_message
     urls = _extract_urls((msg.text or "")) + _extract_urls((msg.caption or ""))
 
@@ -332,5 +309,4 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text(M.queue_ack(len(urls)))
         return
 
-    # No URLs: treat as Telegram media
     asyncio.create_task(_process_telegram_media(update, context))

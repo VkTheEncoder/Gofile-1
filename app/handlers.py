@@ -78,7 +78,7 @@ def _make_progress_cb(status_msg: "_ThrottleEdit"):
             pct = downloaded / total
             bar = _progress_bar(pct)
             text = f"📥 Downloading… {bar}  {pct*100:5.1f}% "
-                   f"({_fmt_bytes(downloaded)} / {_fmt_bytes(total)})"
+            text = f"({_fmt_bytes(downloaded)} / {_fmt_bytes(total)})"
         else:
             text = f"📥 Downloading… {_fmt_bytes(downloaded)}"
 

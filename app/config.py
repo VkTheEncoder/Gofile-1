@@ -3,6 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Max bytes allowed for HTTP downloads (default 4 GB here; set what you need)
+MAX_HTTP_DOWNLOAD_MB = int(os.getenv("MAX_HTTP_DOWNLOAD_MB", "4096"))
+
+# Hard time cap while streaming HTTP downloads (seconds). 0 or very large to disable.
+MAX_HTTP_DOWNLOAD_SECONDS = int(os.getenv("MAX_HTTP_DOWNLOAD_SECONDS", "0"))
+
 MAX_CONCURRENT_TRANSFERS = int(os.getenv("MAX_CONCURRENT_TRANSFERS", "1"))  # tune as you like
 BOT_API_BASE_URL = os.getenv("BOT_API_BASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

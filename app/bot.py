@@ -39,12 +39,8 @@ def main():
         link_preview_options=LinkPreviewOptions(is_disabled=True),  # NEW
     )
     
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .defaults(defaults)
-        .build()
-    )
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults)
+    app = builder.build()
     if BOT_API_BASE_URL:
         # Ensure trailing slash for PTB custom Bot API base URL
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")

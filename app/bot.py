@@ -4,7 +4,8 @@ import logging
 from telegram import Update
 from telegram.constants import MessageEntityType
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
+from telegram.constants import ParseMode
+from telegram.ext import Defaults
 from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL, MAX_CONCURRENT_TRANSFERS
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
@@ -32,7 +33,8 @@ def main():
     # 1) Build application
     pool = AccountPool(GOFILE_TOKENS)
 
-    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults)
     if BOT_API_BASE_URL:
         # Ensure trailing slash for PTB custom Bot API base URL
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")

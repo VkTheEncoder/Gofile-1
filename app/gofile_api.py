@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import os, time, asyncio, inspect, re
+import os, time, asyncio, inspect, re, json
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote
 
 import aiohttp
 from aiohttp import MultipartWriter, payload
 
-API_BASE   = "https://api.gofile.io"
-UPLOAD_URL = "https://upload.gofile.io/uploadfile"
+API_BASE = "https://api.gofile.io"
 
 # ---------- filename normalization ----------
 
@@ -29,6 +28,7 @@ def _sanitize_filename(name: str, max_len: int = 180) -> str:
 # ---------- async file iterator ----------
 
 async def _iter_file(path: str, chunk_size: int = 1024 * 1024, on_chunk=None):
+    """Chunked async reader with optional progress callback (sync or async)."""
     loop = asyncio.get_event_loop()
 
     def _read(f, n):
@@ -59,7 +59,7 @@ class GofileClient:
 
     async def __aenter__(self):
         if self.session is None:
-            timeout = aiohttp.ClientTimeout(total=3600)
+            timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour for big uploads
             self.session = aiohttp.ClientSession(timeout=timeout)
             self._owned_session = True
         return self
@@ -69,7 +69,7 @@ class GofileClient:
             await self.session.close()
 
     def _headers(self) -> Dict[str, str]:
-        # GoFile expects plain token in Authorization header (no "Bearer ")
+        # GoFile expects plain token here (no "Bearer ")
         return {"Authorization": self.token}
 
     async def get_account_id(self) -> Optional[str]:
@@ -93,17 +93,21 @@ class GofileClient:
 
     @staticmethod
     def _extract_usage(info: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        """Return (used_bytes, limit_bytes) if present, else (None, None)."""
         data = info.get("data", info)
+
         traffic = data.get("traffic") or data.get("monthlyTraffic") or data.get("bandwidth")
         if isinstance(traffic, dict):
             used  = traffic.get("used") or traffic.get("current") or traffic.get("value")
             limit = traffic.get("limit") or traffic.get("max") or traffic.get("quota")
             if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
                 return int(used), int(limit)
+
         used  = data.get("trafficUsed") or data.get("monthlyTrafficUsed")
         limit = data.get("trafficLimit") or data.get("monthlyTrafficLimit")
         if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
             return int(used), int(limit)
+
         return None, None
 
     async def is_quota_exhausted(self, threshold: float = 0.995) -> Optional[bool]:
@@ -121,6 +125,12 @@ class GofileClient:
         folder_id: Optional[str] = None,
         progress_status=None
     ) -> Dict[str, Any]:
+        # pick best server
+        async with self.session.get(f"{API_BASE}/getServer", headers=self._headers()) as s:
+            s.raise_for_status()
+            server = (await s.json(content_type=None))["data"]["server"]
+        upload_url = f"https://{server}.gofile.io/uploadFile"
+
         params: Dict[str, Any] = {}
         if folder_id:
             params["folderId"] = folder_id
@@ -151,7 +161,7 @@ class GofileClient:
             {"Content-Disposition": f'form-data; name="file"; filename="{disp_name}"'},
         )
 
-        async with self.session.post(UPLOAD_URL, data=mp, params=params, headers=self._headers()) as resp:
+        async with self.session.post(upload_url, data=mp, params=params, headers=self._headers()) as resp:
             # final “100% (processing…)”
             if progress_status:
                 try:
@@ -159,22 +169,19 @@ class GofileClient:
                 except Exception:
                     pass
 
-            # try to parse JSON; if not, capture raw text for debugging
             raw_text = await resp.text()
             try:
-                j = await asyncio.get_running_loop().run_in_executor(None, lambda: aiohttp.helpers.json.loads(raw_text))
+                j = json.loads(raw_text)
             except Exception:
                 j = {"status": "unknown", "raw": raw_text}
 
-            # Normalize shape so handlers always see top-level keys
             data = j.get("data") or j
-
             normalized = {
                 "status": j.get("status") or data.get("status") or ("ok" if resp.status == 200 else "error"),
                 "downloadPage": data.get("downloadPage") or data.get("downloadUrl") or data.get("page"),
                 "contentId": data.get("contentId") or data.get("fileId") or data.get("id") or data.get("code"),
                 "fileName": data.get("fileName") or disp_name,
-                "raw": j,  # keep full payload for debugging if needed
+                "raw": j,
             }
 
             if resp.status != 200 or normalized["status"] not in ("ok", "OK", "success"):

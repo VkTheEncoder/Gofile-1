@@ -7,7 +7,8 @@ from urllib.parse import unquote
 import aiohttp
 from aiohttp import MultipartWriter, payload
 
-API_BASE = "https://api.gofile.io"
+API_BASE    = "https://api.gofile.io"
+UPLOAD_URL  = "https://upload.gofile.io/uploadfile"  # global upload endpoint (no getServer)
 
 # ---------- filename normalization ----------
 
@@ -69,7 +70,7 @@ class GofileClient:
             await self.session.close()
 
     def _headers(self) -> Dict[str, str]:
-        # GoFile expects plain token here (no "Bearer ")
+        # GoFile expects the token as-is (no "Bearer ")
         return {"Authorization": self.token}
 
     async def get_account_id(self) -> Optional[str]:
@@ -125,12 +126,9 @@ class GofileClient:
         folder_id: Optional[str] = None,
         progress_status=None
     ) -> Dict[str, Any]:
-        # pick best server
-        async with self.session.get(f"{API_BASE}/getServer", headers=self._headers()) as s:
-            s.raise_for_status()
-            server = (await s.json(content_type=None))["data"]["server"]
-        upload_url = f"https://{server}.gofile.io/uploadFile"
-
+        """
+        Upload via the global endpoint; no /getServer step.
+        """
         params: Dict[str, Any] = {}
         if folder_id:
             params["folderId"] = folder_id
@@ -148,7 +146,7 @@ class GofileClient:
             if now - last["t"] >= 1:
                 try:
                     pct = (last["sent"] / file_size * 100) if file_size else 0.0
-                    pct = min(pct, 99.9)
+                    pct = min(pct, 99.9)  # don't show 100% until server replies
                     asyncio.create_task(progress_status.edit(f"⬆️ Uploading… {pct:.1f}%"))
                 except Exception:
                     pass
@@ -161,7 +159,7 @@ class GofileClient:
             {"Content-Disposition": f'form-data; name="file"; filename="{disp_name}"'},
         )
 
-        async with self.session.post(upload_url, data=mp, params=params, headers=self._headers()) as resp:
+        async with self.session.post(UPLOAD_URL, data=mp, params=params, headers=self._headers()) as resp:
             # final “100% (processing…)”
             if progress_status:
                 try:

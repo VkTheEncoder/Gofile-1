@@ -29,7 +29,6 @@ async def _iter_file(path: str, chunk_size: int = 1024 * 1024, on_chunk=None):
                     try:
                         on_chunk(len(chunk))
                     except Exception:
-                        # Never fail the upload due to progress reporting
                         pass
             yield chunk
 
@@ -75,10 +74,6 @@ class GofileClient:
 
     @staticmethod
     def _extract_usage(info: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-        """
-        Return (used_bytes, limit_bytes) if present, else (None, None).
-        Tries multiple shapes because the API payload can vary.
-        """
         data = info.get("data", info)
 
         traffic = data.get("traffic") or data.get("monthlyTraffic") or data.get("bandwidth")
@@ -114,7 +109,7 @@ class GofileClient:
         if folder_id:
             params["folderId"] = folder_id
 
-        # SYNC progress callback; we schedule Telegram edits via create_task
+        file_size = os.path.getsize(file_path)
         last = {"t": time.time(), "sent": 0}
 
         def on_chunk(n: int):
@@ -124,8 +119,8 @@ class GofileClient:
             now = time.time()
             if now - last["t"] >= 1:
                 try:
-                    size = os.path.getsize(file_path)
-                    pct = (last["sent"] / size) * 100 if size else 0.0
+                    pct = (last["sent"] / file_size * 100) if file_size else 0.0
+                    pct = min(pct, 99.9)  # never show 100% until done
                     asyncio.create_task(
                         progress_status.edit(f"⬆️ Uploading… {pct:.1f}%")
                     )
@@ -133,11 +128,11 @@ class GofileClient:
                     pass
                 last["t"] = now
 
-        # Build multipart payload with an async streaming body
+        # multipart payload
         mp = MultipartWriter("form-data")
         mp.append(
             payload.AsyncIterablePayload(
-                _iter_file(file_path, 1024 * 1024, on_chunk)  # 1MB chunks
+                _iter_file(file_path, 1024 * 1024, on_chunk)  # 1 MB chunks
             ),
             {
                 "Content-Disposition": f'form-data; name="file"; filename="{os.path.basename(file_path)}"'
@@ -150,4 +145,12 @@ class GofileClient:
             j = await resp.json(content_type=None)
             if resp.status != 200:
                 return {"error": True, "status": resp.status, "response": j}
+
+            # ✅ one final update at 100%
+            if progress_status:
+                try:
+                    await progress_status.edit("⬆️ Uploading… 100% (processing…)")
+                except Exception:
+                    pass
+
             return j.get("data", j)

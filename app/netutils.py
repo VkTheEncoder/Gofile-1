@@ -113,32 +113,44 @@ async def smart_download(url: str, out_path: str):
     async with httpx.AsyncClient(http2=True, timeout=timeout, limits=limits) as client:
         size, ranged = await _head(url, client)
 
-        if size <= 0 or not ranged:
-            mode = "r+b" if os.path.exists(out_path) else "w+b"
-            with open(out_path, mode) as fp:
-                downloaded = fp.seek(0, os.SEEK_END)
-                headers = {}
-                if downloaded:
-                    headers["Range"] = f"bytes={downloaded}-"
                 attempt = 0
-                while True:
-                    try:
-                        async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
-                            if r.status_code not in (200, 206):
-                                r.raise_for_status()
-                            pos = downloaded
-                            async for chunk in r.aiter_bytes():
-                                if not chunk:
-                                    continue
-                                fp.seek(pos)
-                                fp.write(chunk)
-                                pos += len(chunk)
-                        return
-                    except Exception:
-                        attempt += 1
-                        if attempt > MAX_RETRIES:
-                            raise
-                        await asyncio.sleep(_rng_delay(attempt))
+        while True:
+            try:
+                async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
+                    if r.status_code not in (200, 206):
+                        r.raise_for_status()
+                    pos = downloaded
+                    async for chunk in r.aiter_bytes():
+                        if not chunk:
+                            continue
+                        fp.seek(pos)
+                        fp.write(chunk)
+                        pos += len(chunk)
+
+                # ✅ After a successful pass, confirm we’re complete if size is known.
+                if size > 0:
+                    final = pos
+                    if final < size:
+                        # not done yet → resume from where we stopped
+                        downloaded = final
+                        headers = {"Range": f"bytes={downloaded}-"}
+                        continue
+
+                # done
+                return
+
+            except Exception:
+                attempt += 1
+                if attempt > MAX_RETRIES:
+                    raise
+                # ensure we resume from current file end on retry
+                try:
+                    downloaded = fp.seek(0, os.SEEK_END)
+                    headers = {"Range": f"bytes={downloaded}-"}
+                except Exception:
+                    headers = {}
+                await asyncio.sleep(_rng_delay(attempt))
+
         else:
             parts = max(1, min(MAX_PARTS, math.ceil(size / PART_SIZE)))
             with open(out_path, "w+b") as fp:

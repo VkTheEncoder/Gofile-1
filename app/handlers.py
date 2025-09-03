@@ -17,7 +17,7 @@ from pyrogram.errors import RPCError
 from . import messages as M
 from .pyro_client import get_client
 # ⬇️ REPLACED: use our robust downloader instead of app.http_downloader
-from .netutils import smart_download
+from .netutils import smart_download, pick_filename_for_url, sanitize_filename
 # ⬇️ import BOT_API_BASE_URL + TELEGRAM_BOT_TOKEN so we can build TG file URLs
 from .config import DOWNLOAD_DIR, BOT_API_BASE_URL, TELEGRAM_BOT_TOKEN
 from .account_pool import AccountPool
@@ -214,10 +214,12 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
         path = None
         try:
             await status.edit(M.url_downloading())
-            # ⬇️ robust HTTP downloader replaces previous http_download(...)
-            filename_hint = os.path.basename(re.sub(r"[?#].*$", "", url)) or "download.bin"
+
+            # ⬇️ choose a good, human filename
+            fname = await pick_filename_for_url(url, default="download.bin")
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            path = os.path.join(DOWNLOAD_DIR, filename_hint)
+            path = os.path.join(DOWNLOAD_DIR, fname)
+
             await smart_download(url, path)
         except Exception as e:
             await status.edit(M.error("URL download", f"{type(e).__name__}: {e}"))
@@ -241,7 +243,10 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                     except Exception:
                         size_mb = 0.0
                     link = dl or ""
-                    await status.edit(M.upload_success(filename, size_mb, link) + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""))
+                    await status.edit(
+                        M.upload_success(filename, size_mb, link)
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                    )
                     break
                 else:
                     await pool.mark_exhausted(idx)

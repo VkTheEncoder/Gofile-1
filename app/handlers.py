@@ -50,6 +50,42 @@ class _ThrottleEdit:
                 # We don't want a failed UI edit to crash the flow
                 pass
 
+# --- progress helpers for HTTP downloads ---
+def _fmt_bytes(n: int) -> str:
+    try:
+        return f"{n / (1024 * 1024):.1f} MB"
+    except Exception:
+        return f"{n} B"
+
+def _progress_bar(p: float, width: int = 18) -> str:
+    p = max(0.0, min(1.0, p))
+    filled = int(p * width)
+    return "█" * filled + "░" * (width - filled)
+
+def _make_progress_cb(status_msg: "_ThrottleEdit"):
+    import time
+    last_edit = 0.0
+
+    async def cb(total: int | None, downloaded: int):
+        nonlocal last_edit
+        now = time.time()
+        # throttle UI to ~1 update/sec (download can be very chatty)
+        if now - last_edit < 1.0 and downloaded:
+            return
+        last_edit = now
+
+        if total and total > 0:
+            pct = downloaded / total
+            bar = _progress_bar(pct)
+            text = f"📥 Downloading… {bar}  {pct*100:5.1f}%  ({_fmt_bytes(downloaded)} / {_fmt_bytes(total)})"
+        else:
+            text = f"📥 Downloading… {_fmt_bytes(downloaded)}"
+
+        # normal (throttled) edit is fine here
+        await status_msg.edit(text)
+
+    return cb
+
 def _fmt_speed(bytes_per_sec: float) -> str:
     if bytes_per_sec >= 1024**2:
         return f"{bytes_per_sec/1024**2:.2f} MB/s"
@@ -115,7 +151,8 @@ async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_
     file_url = f"{base}/file/bot{TELEGRAM_BOT_TOKEN}/{tfile.file_path}"
 
     await status.edit(M.url_downloading())
-    await smart_download(file_url, dest)
+    progress_cb = _make_progress_cb(status)            # << show progress for TG file fetch
+    await smart_download(file_url, dest, progress=progress_cb)
     return dest
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -214,13 +251,15 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
         status = _ThrottleEdit(status_msg, interval=1.0)
         path = None
         try:
+            # progress-visible HTTP download
             await status.edit(M.url_downloading())
-            fname = await pick_filename_for_url(url, default="download.bin")
+            fname = pick_filename_for_url(url, fallback="download.bin")  # << no await; correct kw
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
             path = os.path.join(DOWNLOAD_DIR, fname)
-            await smart_download(url, path)
+            progress_cb = _make_progress_cb(status)                      # << progress for HTTP
+            await smart_download(url, path, progress=progress_cb)
         except Exception as e:
-            await status.edit(M.error("URL download", f"{type(e).__name__}: {e}"))
+            await status.edit(M.error("URL download", f"{type(e).__name__}: {e}"), force=True)
             return
 
         pool: AccountPool = context.bot_data["pool"]
@@ -248,11 +287,10 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
                         + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""),
                         force=True,
                     )
-
                     break
                 else:
                     if isinstance(result, dict) and result.get("error"):
-                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"))
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"), force=True)
                         return
                     await pool.mark_exhausted(idx)
             else:
@@ -278,17 +316,17 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                 try:
                     path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
                 except RPCError as e2:
-                    await status.edit(M.error("Download via MTProto", str(e2)))
+                    await status.edit(M.error("Download via MTProto", str(e2)), force=True)
                     return
             else:
-                await status.edit(M.error("Download", str(e)))
+                await status.edit(M.error("Download", str(e)), force=True)
                 return
 
         if not path:
             try:
                 path = await _download_via_pyrogram(update, DOWNLOAD_DIR, status)
             except Exception:
-                await status.edit(M.no_file_found())
+                await status.edit(M.no_file_found(), force=True)
                 return
 
         pool: AccountPool = context.bot_data["pool"]
@@ -316,11 +354,10 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
                         + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else ""),
                         force=True,
                     )
-
                     break
                 else:
                     if isinstance(result, dict) and result.get("error"):
-                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"))
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"), force=True)
                         return
                     await pool.mark_exhausted(idx)
             else:

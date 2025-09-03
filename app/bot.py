@@ -34,7 +34,7 @@ def main():
     pool = AccountPool(GOFILE_TOKENS)
 
     defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults)
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
     if BOT_API_BASE_URL:
         # Ensure trailing slash for PTB custom Bot API base URL
         builder = builder.base_url(BOT_API_BASE_URL.rstrip("/") + "/")

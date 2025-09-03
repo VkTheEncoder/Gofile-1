@@ -103,55 +103,66 @@ async def smart_download(url: str, out_path: str):
     """
     Robust downloader:
       - HTTP/2
-      - Retry on read/EOF (fixes 'ContentLengthError: not enough data...')
-      - Resume when server supports ranges
-      - Parallel range parts for throughput
+      - Retries on EOF/read errors
+      - Resumes when server supports ranges
+      - Parallel range parts when size is known & ranged
     """
     limits  = httpx.Limits(max_connections=20, max_keepalive_connections=20)
+    # generous timeouts so long videos don’t cut off after ~2–3 mins
     timeout = httpx.Timeout(connect=60.0, read=900.0, write=300.0, pool=900.0)
 
     async with httpx.AsyncClient(http2=True, timeout=timeout, limits=limits) as client:
         size, ranged = await _head(url, client)
 
+        # ---------- SINGLE-STREAM (no Accept-Ranges or unknown size) ----------
+        if size <= 0 or not ranged:
+            # open/create file and figure out how much (if anything) we already have
+            mode = "r+b" if os.path.exists(out_path) else "w+b"
+            with open(out_path, mode) as fp:
+                downloaded = fp.seek(0, os.SEEK_END)
+                headers = {}
+                if downloaded:
+                    headers["Range"] = f"bytes={downloaded}-"
+
                 attempt = 0
-        while True:
-            try:
-                async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
-                    if r.status_code not in (200, 206):
-                        r.raise_for_status()
-                    pos = downloaded
-                    async for chunk in r.aiter_bytes():
-                        if not chunk:
+                while True:
+                    try:
+                        async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
+                            if r.status_code not in (200, 206):
+                                r.raise_for_status()
+
+                            pos = downloaded
+                            async for chunk in r.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                fp.seek(pos)
+                                fp.write(chunk)
+                                pos += len(chunk)
+
+                        # If we know the expected size, verify completeness and resume if needed.
+                        if size > 0 and pos < size:
+                            downloaded = pos
+                            headers = {"Range": f"bytes={downloaded}-"}
                             continue
-                        fp.seek(pos)
-                        fp.write(chunk)
-                        pos += len(chunk)
 
-                # ✅ After a successful pass, confirm we’re complete if size is known.
-                if size > 0:
-                    final = pos
-                    if final < size:
-                        # not done yet → resume from where we stopped
-                        downloaded = final
-                        headers = {"Range": f"bytes={downloaded}-"}
-                        continue
+                        # done
+                        return
 
-                # done
-                return
+                    except Exception:
+                        attempt += 1
+                        if attempt > MAX_RETRIES:
+                            raise
+                        # resume from current end on retry
+                        try:
+                            downloaded = fp.seek(0, os.SEEK_END)
+                            headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
+                        except Exception:
+                            headers = {}
+                        await asyncio.sleep(_rng_delay(attempt))
 
-            except Exception:
-                attempt += 1
-                if attempt > MAX_RETRIES:
-                    raise
-                # ensure we resume from current file end on retry
-                try:
-                    downloaded = fp.seek(0, os.SEEK_END)
-                    headers = {"Range": f"bytes={downloaded}-"}
-                except Exception:
-                    headers = {}
-                await asyncio.sleep(_rng_delay(attempt))
-
+        # ---------- PARALLEL RANGED DOWNLOAD ----------
         else:
+            # use multiple parts for throughput; PART_SIZE / MAX_PARTS are module-level tunables
             parts = max(1, min(MAX_PARTS, math.ceil(size / PART_SIZE)))
             with open(out_path, "w+b") as fp:
                 fp.truncate(size)  # preallocate contiguous file

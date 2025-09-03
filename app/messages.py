@@ -1,13 +1,25 @@
 # app/messages.py
 from __future__ import annotations
 from html import escape
+from typing import Any
 
 def start() -> str:
     return (
-        "<b>GoFile Uploader</b>\n"
-        "Send a <i>document / video / audio / photo</i> or paste a <i>direct URL</i>.\n"
-        "I’ll download it and upload to <b>GoFile</b>, then reply with the share link."
+        "<b>👋 Welcome to GoFile Uploader Bot</b>\n\n"
+        "Send me any <i>document, video, audio, or photo</i> "
+        "or paste a <i>direct download link (URL)</i>.\n\n"
+        "I will:\n"
+        "1️⃣ <b>Download</b> the file\n"
+        "2️⃣ <b>Upload</b> it to <a href=\"https://gofile.io\">GoFile.io</a>\n"
+        "3️⃣ <b>Reply</b> with a shareable link ✅\n\n"
+        "<b>Available Commands:</b>\n"
+        "• <code>/start</code> – Show this message\n"
+        "• <code>/help</code> – How to use the bot\n"
+        "• <code>/stats</code> – View GoFile account usage\n\n"
+        "<i>Tip: You can send multiple URLs in one message, "
+        "and I’ll queue them all automatically ⏳</i>"
     )
+
 
 def help_text() -> str:
     return (
@@ -55,10 +67,25 @@ def all_exhausted() -> str:
 def no_file_found() -> str:
     return "❌ <b>No file found</b>\nPlease send a media file or a direct URL."
 
-def stats_header(idx: int, account_id: str | None, used_gb: float | None, limit_gb: float | None) -> str:
+def _to_display_str(val: Any) -> str:
+    """Return a stable, short display string for IDs that might be dicts/objects."""
+    if val is None:
+        return ""
+    try:
+        if isinstance(val, dict):
+            # Prefer common keys if present; else fallback to str(dict)
+            for k in ("id", "accountId", "account_id", "name", "token"):
+                if k in val and val[k]:
+                    return str(val[k])
+        return str(val)
+    except Exception:
+        return ""
+
+def stats_header(idx: int, account_id: Any, used_gb: float | None, limit_gb: float | None) -> str:
     lines = [f"🧮 <b>Account candidate index:</b> {idx}"]
-    if account_id:
-        lines.append(f"🆔 <b>Account ID:</b> <code>{escape(account_id)}</code>")
+    acc_str = _to_display_str(account_id)
+    if acc_str:
+        lines.append(f"🆔 <b>Account ID:</b> <code>{escape(acc_str)}</code>")
     if used_gb is not None and limit_gb is not None and limit_gb > 0:
         lines.append(f"📊 <b>Monthly traffic:</b> {used_gb:.2f} / {limit_gb:.2f} GB")
     else:

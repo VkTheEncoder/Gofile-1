@@ -8,7 +8,8 @@ from telegram.error import BadRequest
 from .pyro_client import get_client
 from pyrogram.errors import RPCError
 import time
-
+import mimetypes
+from pathlib import Path
 from app.http_downloader import http_download
 import re
 from telegram import Update
@@ -145,18 +146,50 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         txt.append("Usage fields not provided by API (free accounts expose limited info)." )
     await update.message.reply_text("\n".join(txt))
 
+def _guess_filename_from_msg(m) -> str:
+    # Try to reuse Telegram-provided filenames where possible
+    for attr in ("document", "video", "audio", "voice", "photo", "animation", "video_note"):
+        media = getattr(m, attr, None)
+        if not media:
+            continue
+        # document/video/audio often carry a file_name
+        fn = getattr(media, "file_name", None)
+        if fn:
+            return fn
+
+        # photo has no name; give it a jpeg with unique id
+        if attr == "photo":
+            return f"photo_{media.file_unique_id}.jpg"
+
+    # Fallback: use caption hint or message id with extension guess
+    ext = ""
+    mt = getattr(m, "mime_type", None) or getattr(getattr(m, "document", None), "mime_type", None)
+    if mt:
+        ext = mimetypes.guess_extension(mt) or ""
+    return f"{m.id}{ext or '.bin'}"
+
 async def _download_via_pyrogram(update, dest_dir: str, status: _ThrottleEdit) -> str | None:
     os.makedirs(dest_dir, exist_ok=True)
+
     chat_id = update.effective_chat.id
     msg_id = update.effective_message.message_id
 
     client = await get_client()
     m = await client.get_messages(chat_id, msg_id)
 
+    # ✅ Build a full file path (folder + filename)
+    filename = _guess_filename_from_msg(m)
+    # sanitize a bit
+    filename = re.sub(r"[^\w.\-()+\[\]{} ]+", "_", filename).strip(" .")
+    if not filename:
+        filename = f"{m.id}.bin"
+
+    full_path = str(Path(dest_dir) / filename)
+
     start = time.time()
     loop = asyncio.get_running_loop()
     return await m.download(
-        file_name=dest_dir,
+        file_name=full_path,  # <— pass a full path, not just the folder
         progress=_pyro_progress_factory(status, start, loop),
         progress_args=()
     )

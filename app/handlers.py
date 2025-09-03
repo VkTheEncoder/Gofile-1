@@ -44,9 +44,12 @@ class _ThrottleEdit:
         if now - self._last >= self.interval:
             self._last = now
             try:
-                await self.msg.edit_text(text)
+                await self.msg.edit_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
             except Exception:
-                # Silently ignore edit races (message not modified / deleted etc.)
                 pass
 
 

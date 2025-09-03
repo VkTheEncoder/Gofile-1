@@ -1,114 +1,173 @@
 # app/http_downloader.py
 from __future__ import annotations
-
 import asyncio
 import os
 import re
-import tempfile
-from typing import Optional, Dict, Any
-from urllib.parse import urlparse, unquote
-
+import time
+from pathlib import Path
+from typing import Optional
 import aiohttp
+from yarl import URL
 
-_FILENAME_RE = re.compile(r'filename\*=UTF-8\'\'([^;]+)|filename="([^"]+)"|filename=([^;]+)', re.I)
+# Chunk size for streaming
+_CHUNK = 1 << 14  # 16 KiB
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/124.0.0.0 Safari/537.36")
 
-def _guess_filename_from_headers(headers: aiohttp.typedefs.LooseHeaders, url: str, default_ext: str = "") -> str:
+def _guess_filename_from_headers(url: str, headers: aiohttp.typedefs.LooseHeaders) -> str:
+    # Try Content-Disposition
     cd = headers.get("Content-Disposition") or headers.get("content-disposition")
     if cd:
-        m = _Filename_R = _FILENAME_RE.search(cd)
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
         if m:
-            fname = next(g for g in m.groups() if g)  # first non-None capture
-            return unquote(fname).strip().strip('"')
-    # fallback to URL path
-    path = urlparse(url).path
-    base = os.path.basename(path)
-    if base:
-        return unquote(base)
-    return f"download{default_ext}"
+            return m.group(1).strip().strip('"')
+    # Fallback to path
+    name = os.path.basename(URL(url).path) or "download.bin"
+    return name
 
 async def http_download(
     url: str,
-    dest_dir: Optional[str] = None,
-    status=None,  # Telegram message editor (optional)
-    session: Optional[aiohttp.ClientSession] = None,
-    chunk_size: int = 4 * 1024 * 1024,  # 4MB chunks for speed
-    headers: Optional[Dict[str, str]] = None,
-    follow_redirects: bool = True,
+    dest_dir: str,
+    status=None,  # your _ThrottleEdit
+    max_retries: int = 3,
+    connect_timeout: int = 20,
+    read_timeout: int = 60,
 ) -> str:
     """
-    Downloads a file via HTTP(S) to a temp path and returns the file path.
-    Shows progress via `status.edit(...)` if provided.
+    Download URL to dest_dir, with:
+      - Browser-like headers (UA/Accept/Accept-Language)
+      - Redirects allowed
+      - Resume on early EOF / partial responses (Range)
+      - Progress updates via `status.edit(...)` if provided
+    Returns: full file path
+    Raises: last exception if it cannot complete within retry budget
     """
-    close_session = False
-    if session is None:
-        timeout = aiohttp.ClientTimeout(total=None, sock_read=600, sock_connect=30)
-        session = aiohttp.ClientSession(timeout=timeout)
-        close_session = True
-
+    os.makedirs(dest_dir, exist_ok=True)
+    # Basic Referer: same origin
     try:
-        req_headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; GoFileBot/1.0; +https://example)",
-            "Accept": "*/*",
-        }
-        if headers:
-            req_headers.update(headers)
+        referer = str(URL(url).with_path("/"))
+    except Exception:
+        referer = None
 
-        async with session.get(url, headers=req_headers, allow_redirects=follow_redirects) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length", "0")) or None
-            filename = _guess_filename_from_headers(resp.headers, url)
-            suffix = os.path.splitext(filename)[1] if "." in filename else ""
-            td = dest_dir or tempfile.gettempdir()
-            os.makedirs(td, exist_ok=True)
+    timeout = aiohttp.ClientTimeout(
+        total=None, connect=connect_timeout, sock_read=read_timeout
+    )
 
-            # pre-create a temp path using the header filename if present
-            tmp_path = os.path.join(td, filename) if filename else tempfile.mkstemp(prefix="dl_", suffix=suffix)[1]
-            # ensure uniqueness
-            i = 1
-            base, ext = os.path.splitext(tmp_path)
-            while os.path.exists(tmp_path):
-                tmp_path = f"{base}({i}){ext}"
-                i += 1
+    # We might not know size yet
+    total_size: Optional[int] = None
+    file_name: Optional[str] = None
 
-            downloaded = 0
-            t0 = asyncio.get_event_loop().time()
-            with open(tmp_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(chunk_size):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if status and (downloaded % (chunk_size * 2) == 0):  # throttle UI updates
+    # Temp path to allow resume
+    tmp_path = Path(dest_dir) / f".part-{int(time.time()*1000)}"
+    bytes_done = 0
+    attempt = 0
+    last_err: Exception | None = None
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while attempt < max_retries:
+            attempt += 1
+            headers = {
+                "User-Agent": _UA,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Connection": "keep-alive",
+            }
+            if referer:
+                headers["Referer"] = referer
+            if bytes_done:
+                headers["Range"] = f"bytes={bytes_done}-"
+
+            try:
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                    # 206 for Range, 200 for normal
+                    if resp.status not in (200, 206):
+                        # Some CDNs respond 302 to a signed URL; aiohttp follows by default
+                        resp.raise_for_status()
+
+                    # First time populate filename and size
+                    if file_name is None:
+                        file_name = _guess_filename_from_headers(url, resp.headers)
+                    # Infer total size
+                    clen = resp.headers.get("Content-Length")
+                    accept_ranges = (resp.headers.get("Accept-Ranges") or "").lower()
+                    if clen and clen.isdigit():
+                        # If resuming, the reported length is the remainder
+                        remainder = int(clen)
+                        total_size = (bytes_done + remainder) if bytes_done else remainder
+                    # Open file for append on resume
+                    mode = "ab" if bytes_done else "wb"
+                    with open(tmp_path, mode) as f:
+                        downloaded_this_attempt = 0
+                        start = time.time()
+
+                        async for chunk in resp.content.iter_chunked(_CHUNK):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            bytes_done += len(chunk)
+                            downloaded_this_attempt += len(chunk)
+
+                            # Progress display (optional)
+                            if status:
+                                # show progress with your standardized block (unknown total if None)
+                                try:
+                                    from . import messages as M  # local import to avoid cycles
+                                except Exception:
+                                    M = None
+                                if M and total_size:
+                                    pct = bytes_done / total_size * 100
+                                    # fabricate a tiny speed
+                                    elapsed = max(0.001, time.time() - start)
+                                    spd = downloaded_this_attempt / elapsed
+                                    progress = M.progress_block(
+                                        pct=pct,
+                                        current_mb=bytes_done / 1024 / 1024,
+                                        total_mb=total_size / 1024 / 1024,
+                                        speed_human=(f"{spd/1024/1024:.2f} MB/s" if spd >= 1024*1024
+                                                     else f"{spd/1024:.2f} KB/s" if spd >= 1024
+                                                     else f"{spd:.0f} B/s"),
+                                    )
+                                    # Use a neutral header here (URL path sets a separate header)
+                                    await status.edit("⬇️ <b>Downloading from URL…</b>\n" + progress)
+
+                    # If we got here, this attempt finished reading the body without errors
+                    # Validate completion if we know the size
+                    if total_size is None or bytes_done >= total_size:
+                        # Finalize filename & move
+                        final_path = Path(dest_dir) / (file_name or "download.bin")
+                        # If final_path exists from old runs, overwrite
                         try:
-                            dt = max(0.001, asyncio.get_event_loop().time() - t0)
-                            spd = downloaded / dt  # bytes/sec
-                            if total:
-                                pct = downloaded * 100.0 / total
-                                await status.edit(
-                                    f"⬇️ Downloading… {pct:.1f}%\n"
-                                    f"{downloaded/1024/1024:.2f} / {total/1024/1024:.2f} MB\n"
-                                    f"Speed: {spd/1024/1024:.2f} MB/s"
-                                )
-                            else:
-                                await status.edit(
-                                    f"⬇️ Downloading…\n"
-                                    f"{downloaded/1024/1024:.2f} MB\n"
-                                    f"Speed: {spd/1024/1024:.2f} MB/s"
-                                )
+                            if final_path.exists():
+                                final_path.unlink()
                         except Exception:
                             pass
+                        tmp_path.replace(final_path)
+                        return str(final_path)
 
-        # final status (optional)
-        if status:
-            try:
-                if total:
-                    await status.edit(f"✅ Downloaded {filename} ({total/1024/1024:.2f} MB). Uploading next…")
-                else:
-                    await status.edit(f"✅ Downloaded {filename}. Uploading next…")
-            except Exception:
-                pass
+                    # If we read less than total_size, loop to resume
+                    # Only if server advertises ranges or we simply try again
+                    continue
 
-        return tmp_path
-    finally:
-        if close_session:
-            await session.close()
+            except (aiohttp.ClientPayloadError, aiohttp.ContentTypeError, aiohttp.ServerDisconnectedError) as e:
+                # Early close or mismatch—try to resume if possible
+                last_err = e
+                await asyncio.sleep(1.0)
+                continue
+            except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, asyncio.TimeoutError) as e:
+                last_err = e
+                await asyncio.sleep(1.0)
+                continue
+            except Exception as e:
+                last_err = e
+                break
+        # Exhausted retries
+        # Cleanup partial if present
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        if last_err:
+            raise last_err
+        raise RuntimeError("Download failed for unknown reason")

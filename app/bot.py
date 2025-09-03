@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL, MAX_CONCURRENT_TRANSFERS
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
-
+import asyncio
 
 # --- logging ---
 logging.basicConfig(

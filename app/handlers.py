@@ -19,7 +19,7 @@ from .pyro_client import get_client
 from .netutils import smart_download, pick_filename_for_url, sanitize_filename
 from .config import DOWNLOAD_DIR, BOT_API_BASE_URL, TELEGRAM_BOT_TOKEN
 from .account_pool import AccountPool
-from .gofile_api import GofileClient  # type clarity
+from .gofile_api import GofileClient
 
 log = logging.getLogger(__name__)
 
@@ -87,9 +87,6 @@ def _pyro_progress_factory(status: _ThrottleEdit, start_time: float, loop):
     return _cb
 
 async def _download_telegram_file(update: Update, context: ContextTypes.DEFAULT_TYPE, status: _ThrottleEdit) -> str | None:
-    """
-    Bot API path, but using a robust HTTP downloader (HTTP/2 + ranges + resume).
-    """
     msg = update.effective_message
     tfile = None
     filename = None
@@ -176,9 +173,6 @@ async def _download_via_pyrogram(update: Update, dest_dir: str, status: _Throttl
     )
 
 def _extract_gofile_result(result: dict) -> tuple[str | None, str | None]:
-    """
-    Return (download_link, content_id) from any GoFile shape.
-    """
     if not isinstance(result, dict):
         return None, None
     data = result.get("data", result)
@@ -194,34 +188,6 @@ def _extract_gofile_result(result: dict) -> tuple[str | None, str | None]:
         result.get("contentId")
     )
     return link, cid
-
-async def _after_upload_show_result(result: dict, path: str, status: _ThrottleEdit) -> bool:
-    """
-    Returns True if we displayed a success, False if caller should try next token.
-    Always prints a readable error if the API explicitly failed.
-    """
-    dl, content_id = _extract_gofile_result(result)
-    if dl:
-        filename = os.path.basename(path)
-        try:
-            size_mb = os.path.getsize(path) / (1024**2)
-        except Exception:
-            size_mb = 0.0
-        await status.edit(
-            M.upload_success(filename, size_mb, dl)
-            + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
-        )
-        return True
-
-    # explicit API error? show it and stop
-    if isinstance(result, dict) and result.get("error"):
-        http = result.get("httpStatus")
-        raw  = result.get("raw")
-        preview = escape(str(raw))[:600]
-        await status.edit(M.error("Upload", f"HTTP {http} | {preview}"))
-        return True  # handled: do not try other tokens
-
-    return False  # let caller try next token
 
 async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     sem = context.bot_data["sem"]
@@ -242,20 +208,34 @@ async def _process_http_url(url: str, update: Update, context: ContextTypes.DEFA
         pool: AccountPool = context.bot_data["pool"]
         try:
             await status.edit(M.upload_start())
-            uploaded = False
             for _ in range(len(pool.tokens)):
                 idx, client = await pool.pick()
                 log.info("Using token index %s for upload (URL)", idx)
-                async with client as c:
-                    result = await c.upload_file(path, progress_status=status)
-                handled = await _after_upload_show_result(result, path, status)
-                if handled:
-                    uploaded = True
+                try:
+                    async with client as c:
+                        result = await c.upload_file(path, progress_status=status)
+                except Exception as e:
+                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"))
+                    return
+
+                dl, content_id = _extract_gofile_result(result)
+                if dl:
+                    filename = os.path.basename(path)
+                    try:
+                        size_mb = os.path.getsize(path) / (1024**2)
+                    except Exception:
+                        size_mb = 0.0
+                    await status.edit(
+                        M.upload_success(filename, size_mb, dl)
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                    )
                     break
                 else:
+                    if isinstance(result, dict) and result.get("error"):
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"))
+                        return
                     await pool.mark_exhausted(idx)
-
-            if not uploaded:
+            else:
                 await status.edit(M.all_exhausted())
         finally:
             try:
@@ -294,20 +274,34 @@ async def _process_telegram_media(update: Update, context: ContextTypes.DEFAULT_
         pool: AccountPool = context.bot_data["pool"]
         try:
             await status.edit(M.upload_start())
-            uploaded = False
             for _ in range(len(pool.tokens)):
                 idx, client = await pool.pick()
                 log.info("Using token index %s for upload (TG)", idx)
-                async with client as c:
-                    result = await c.upload_file(path, progress_status=status)
-                handled = await _after_upload_show_result(result, path, status)
-                if handled:
-                    uploaded = True
+                try:
+                    async with client as c:
+                        result = await c.upload_file(path, progress_status=status)
+                except Exception as e:
+                    await status.edit(M.error("Upload", f"{type(e).__name__}: {e}"))
+                    return
+
+                dl, content_id = _extract_gofile_result(result)
+                if dl:
+                    filename = os.path.basename(path)
+                    try:
+                        size_mb = os.path.getsize(path) / (1024**2)
+                    except Exception:
+                        size_mb = 0.0
+                    await status.edit(
+                        M.upload_success(filename, size_mb, dl)
+                        + (f"\n• <b>Content ID:</b> <code>{escape(str(content_id))}</code>" if content_id else "")
+                    )
                     break
                 else:
+                    if isinstance(result, dict) and result.get("error"):
+                        await status.edit(M.error("Upload", f"HTTP {result.get('httpStatus')} | {escape(str(result.get('raw'))[:600])}"))
+                        return
                     await pool.mark_exhausted(idx)
-
-            if not uploaded:
+            else:
                 await status.edit(M.all_exhausted())
         finally:
             try:

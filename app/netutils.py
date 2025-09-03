@@ -1,175 +1,198 @@
 # app/netutils.py
+
 import asyncio
-import httpx
-import math
 import os
-import random
 import re
-from typing import Tuple, Optional
-from urllib.parse import urlparse, unquote
-from .config import MAX_HTTP_DOWNLOAD_MB, MAX_HTTP_DOWNLOAD_SECONDS
+import math
+import time
+import random
+from urllib.parse import urlparse, unquote, parse_qs
 
-# Tunables via env (safe defaults)
-PART_SIZE = int(os.getenv("RANGE_PART_SIZE_MB", "8")) * 1024 * 1024  # 8 MB
-MAX_PARTS  = int(os.getenv("RANGE_MAX_PARTS", "6"))
-MAX_RETRIES = int(os.getenv("RANGE_MAX_RETRIES", "6"))
+import httpx
 
-# ---------- filename helpers ----------
+# ---------- Tunables ----------
+CONNECT_TIMEOUT = 60.0
+READ_TIMEOUT    = 900.0    # long read → full movies won’t truncate at ~2–3 min
+WRITE_TIMEOUT   = 300.0
+POOL_TIMEOUT    = 900.0
 
-_INVALID = re.compile(r'[\\/:*?"<>|\x00-\x1f]')   # Windows + control chars
-def sanitize_filename(name: str, max_len: int = 180) -> str:
-    name = name.strip().strip(". ")
-    name = _INVALID.sub("_", name)
-    if not name:
-        name = "download.bin"
-    # keep an extension if present
-    if len(name) > max_len:
-        stem, dot, ext = name.rpartition(".")
-        if dot and len(ext) <= 10:
-            keep = max_len - (len(ext) + 1)
-            name = (stem[:keep] or "file") + "." + ext
-        else:
-            name = name[:max_len]
-    return name
+MAX_RETRIES     = 5
+CHUNK_SIZE      = 1024 * 1024  # 1 MiB per chunk
 
-_CD_FILENAME_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?("?)([^";]+)\1', re.IGNORECASE)
+# ---------- Small utils your handlers import ----------
 
-async def pick_filename_for_url(url: str, default: str = "download.bin") -> str:
+def sanitize_filename(name: str) -> str:
+    """Make a safe filesystem name."""
+    name = unquote(name).strip()
+    # remove path separators and control chars
+    name = re.sub(r"[\\/:*?\"<>|\x00-\x1F]", "_", name)
+    # collapse spaces/underscores
+    name = re.sub(r"[\s_]{2,}", " ", name).strip()
+    return name or "file.bin"
+
+def pick_filename_for_url(url: str, fallback: str = "download.bin") -> str:
+    """Heuristically pick a filename from URL path or common query keys."""
+    p = urlparse(url)
+    q = parse_qs(p.query)
+    for key in ("filename", "file", "name", "download", "dl"):
+        if key in q and q[key]:
+            return sanitize_filename(q[key][0])
+    path = unquote(p.path.rstrip("/"))
+    if path:
+        base = os.path.basename(path)
+        if base and "." in base:
+            return sanitize_filename(base)
+    return sanitize_filename(fallback)
+
+# ---------- Internals ----------
+
+def _rng_delay(attempt: int) -> float:
+    """Exponential backoff with jitter."""
+    base = min(30.0, 1.5 ** attempt)
+    return base + random.uniform(0, 0.75)
+
+async def _probe_headers(client: httpx.AsyncClient, url: str) -> tuple[int, bool]:
     """
-    Best-effort filename:
-      1) Content-Disposition filename/filename*
-      2) URL basename (percent-decoded)
-      3) default
+    Return (size, ranged). size = -1 if unknown.
     """
-    limits  = httpx.Limits(max_connections=5, max_keepalive_connections=5)
-    timeout = httpx.Timeout(connect=20.0, read=20.0, write=20.0, pool=20.0)
+    size = -1
+    ranged = False
     try:
-        async with httpx.AsyncClient(http2=True, timeout=timeout, limits=limits) as client:
-            r = await client.head(url, follow_redirects=True)
-            # some servers don't allow HEAD—fallback to GET headers only
-            if r.status_code >= 400:
-                r = await client.get(url, follow_redirects=True, headers={"Range": "bytes=0-0"})
-            cd = r.headers.get("Content-Disposition", "")
-            if cd:
-                m = _CD_FILENAME_RE.search(cd)
-                if m:
-                    name = unquote(m.group(2))
-                    return sanitize_filename(name)
+        r = await client.head(url, follow_redirects=True)
+        # Some origins block HEAD; fall back if needed.
+        if r.status_code < 400:
+            cl = r.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                size = int(cl)
+            ar = r.headers.get("Accept-Ranges", "") or r.headers.get("accept-ranges", "")
+            ranged = "bytes" in ar.lower()
+            return size, ranged
     except Exception:
         pass
 
-    # fallback to URL
-    parsed = urlparse(url)
-    base = os.path.basename(parsed.path) or default
-    base = unquote(base)
-    return sanitize_filename(base or default)
+    # Fallback: GET a single byte with Range to test support & obtain length
+    try:
+        r = await client.get(url, headers={"Range": "bytes=0-0"}, follow_redirects=True)
+        if r.status_code in (200, 206, 416):
+            cl = r.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                # For 206 we only got 1 byte; size header is often 1.
+                # Prefer Content-Range if present: bytes 0-0/123456
+                cr = r.headers.get("Content-Range", "")
+                if "/" in cr:
+                    try:
+                        size = int(cr.split("/")[-1])
+                    except Exception:
+                        size = int(cl)
+                else:
+                    size = int(cl)
+            cr = r.headers.get("Content-Range", "")
+            ranged = "bytes" in cr.lower() or r.status_code == 206
+    except Exception:
+        pass
+    return size, ranged
 
-# ---------- downloader internals ----------
+# ---------- Downloader ----------
 
-def _rng_delay(i: int) -> float:
-    return min(60.0, (2 ** i) + random.uniform(0, 1))
-
-async def _head(url: str, client: httpx.AsyncClient) -> Tuple[int, bool]:
-    r = await client.head(url, follow_redirects=True)
-    r.raise_for_status()
-    size = int(r.headers.get("Content-Length", "-1"))
-    accept_ranges = "bytes" in r.headers.get("Accept-Ranges", "").lower()
-    return size, accept_ranges
-
-async def _fetch_range(url: str, start: int, end: int, client: httpx.AsyncClient, fp, sem: asyncio.Semaphore):
-    headers = {"Range": f"bytes={start}-{end}"}
-    attempt = 0
-    while True:
-        try:
-            async with sem:
-                async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
-                    if r.status_code not in (200, 206):
-                        r.raise_for_status()
-                    pos = start
-                    async for chunk in r.aiter_bytes():
-                        if not chunk:
-                            continue
-                        fp.seek(pos)
-                        fp.write(chunk)
-                        pos += len(chunk)
-            return
-        except Exception:
-            attempt += 1
-            if attempt > MAX_RETRIES:
-                raise
-            await asyncio.sleep(_rng_delay(attempt))
-
-async def smart_download(url: str, out_path: str):
+async def smart_download(url: str, out_path: str, *args, progress=None, chunk_size: int = CHUNK_SIZE, **kwargs) -> str:
     """
-    Robust downloader:
-      - HTTP/2
-      - Retries on EOF/read errors
-      - Resumes when server supports ranges
-      - Parallel range parts when size is known & ranged
+    Robust single-file downloader with resume and long timeouts.
+
+    Parameters
+    ----------
+    url : str
+    out_path : str
+    progress : Optional[callable(total:int|None, downloaded:int)]; called periodically.
+               (If callers pass a 3rd positional arg as a callback, we’ll accept that too.)
+
+    Returns
+    -------
+    str : the out_path
     """
-    limits  = httpx.Limits(max_connections=20, max_keepalive_connections=20)
-    # generous timeouts so long videos don’t cut off after ~2–3 mins
-    timeout = httpx.Timeout(connect=60.0, read=900.0, write=300.0, pool=900.0)
+    # Back-compat: if someone passed a positional callback as 3rd arg
+    if progress is None and args:
+        maybe_cb = args[0]
+        if callable(maybe_cb):
+            progress = maybe_cb
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    limits  = httpx.Limits(max_connections=8, max_keepalive_connections=8)
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT,
+        read=READ_TIMEOUT,
+        write=WRITE_TIMEOUT,
+        pool=POOL_TIMEOUT,
+    )
 
     async with httpx.AsyncClient(http2=True, timeout=timeout, limits=limits) as client:
-        size, ranged = await _head(url, client)
+        total_size, ranged = await _probe_headers(client, url)
 
-        # ---------- SINGLE-STREAM (no Accept-Ranges or unknown size) ----------
-        if size <= 0 or not ranged:
-            # open/create file and figure out how much (if anything) we already have
-            mode = "r+b" if os.path.exists(out_path) else "w+b"
-            with open(out_path, mode) as fp:
-                downloaded = fp.seek(0, os.SEEK_END)
+        # Early exit: if file already complete
+        if total_size > 0 and os.path.exists(out_path) and os.path.getsize(out_path) >= total_size:
+            if callable(progress):
+                await _maybe_await(progress, total_size, total_size)
+            return out_path
+
+        attempt = 0
+        while True:
+            try:
+                # Figure out how much we have and attempt to resume
+                downloaded = 0
                 headers = {}
-                if downloaded:
-                    headers["Range"] = f"bytes={downloaded}-"
+                mode = "r+b" if os.path.exists(out_path) else "w+b"
+                with open(out_path, mode) as fp:
+                    if os.path.exists(out_path):
+                        downloaded = fp.seek(0, os.SEEK_END)
 
-                attempt = 0
-                while True:
-                    try:
-                        async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
-                            if r.status_code not in (200, 206):
-                                r.raise_for_status()
+                    if downloaded > 0 and ranged:
+                        headers["Range"] = f"bytes={downloaded}-"
 
-                            pos = downloaded
-                            async for chunk in r.aiter_bytes():
-                                if not chunk:
-                                    continue
-                                fp.seek(pos)
-                                fp.write(chunk)
-                                pos += len(chunk)
+                    async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
+                        if r.status_code not in (200, 206):
+                            r.raise_for_status()
 
-                        # If we know the expected size, verify completeness and resume if needed.
-                        if size > 0 and pos < size:
-                            downloaded = pos
-                            headers = {"Range": f"bytes={downloaded}-"}
-                            continue
+                        # If we resumed but server ignored Range, we must rewrite from 0.
+                        if downloaded and r.status_code == 200:
+                            fp.seek(0)
+                            fp.truncate(0)
+                            downloaded = 0
 
-                        # done
-                        return
+                        if callable(progress):
+                            await _maybe_await(progress, total_size if total_size > 0 else None, downloaded)
 
-                    except Exception:
-                        attempt += 1
-                        if attempt > MAX_RETRIES:
-                            raise
-                        # resume from current end on retry
-                        try:
-                            downloaded = fp.seek(0, os.SEEK_END)
-                            headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
-                        except Exception:
-                            headers = {}
-                        await asyncio.sleep(_rng_delay(attempt))
+                        async for chunk in r.aiter_bytes(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
+                            fp.seek(downloaded)
+                            fp.write(chunk)
+                            downloaded += len(chunk)
+                            if callable(progress):
+                                await _maybe_await(progress, total_size if total_size > 0 else None, downloaded)
 
-        # ---------- PARALLEL RANGED DOWNLOAD ----------
-        else:
-            # use multiple parts for throughput; PART_SIZE / MAX_PARTS are module-level tunables
-            parts = max(1, min(MAX_PARTS, math.ceil(size / PART_SIZE)))
-            with open(out_path, "w+b") as fp:
-                fp.truncate(size)  # preallocate contiguous file
-                sem = asyncio.Semaphore(parts)
-                tasks = []
-                for i in range(parts):
-                    start = i * PART_SIZE
-                    end = min(size - 1, (i + 1) * PART_SIZE - 1)
-                    tasks.append(_fetch_range(url, start, end, client, fp, sem))
-                await asyncio.gather(*tasks)
+                # Verify completeness if we know size; otherwise accept as done
+                if total_size > 0 and downloaded < total_size:
+                    # server closed early — loop and resume
+                    attempt += 1
+                    if attempt > MAX_RETRIES:
+                        raise RuntimeError(f"download stalled after {attempt} attempts; got {downloaded}/{total_size} bytes")
+                    await asyncio.sleep(_rng_delay(attempt))
+                    continue
+
+                return out_path
+
+            except Exception as e:
+                attempt += 1
+                if attempt > MAX_RETRIES:
+                    raise
+                await asyncio.sleep(_rng_delay(attempt))
+
+# helper: allow both sync/async progress callbacks
+async def _maybe_await(fn, total, downloaded):
+    try:
+        ret = fn(total, downloaded)
+        if asyncio.iscoroutine(ret):
+            await ret
+    except Exception:
+        # progress is best-effort; ignore failures
+        pass

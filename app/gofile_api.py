@@ -1,17 +1,37 @@
 from __future__ import annotations
 
-import os, time, asyncio, inspect
+import os, time, asyncio, inspect, re
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import unquote
 
 import aiohttp
 from aiohttp import MultipartWriter, payload
 
-API_BASE = "https://api.gofile.io"
+API_BASE   = "https://api.gofile.io"
 UPLOAD_URL = "https://upload.gofile.io/uploadfile"
 
+# ---------- filename normalization ----------
 
-# Chunked async file reader with optional progress callback (sync or async)
+_INVALID = re.compile(r'[\\/:*?"<>|\x00-\x1f]')  # Windows-reserved + control chars
+
+def _sanitize_filename(name: str, max_len: int = 180) -> str:
+    """Make a name safe for GoFile display (no FS rename needed)."""
+    name = unquote(name or "").strip().strip(". ")       # percent-decode + trim dots/spaces
+    name = _INVALID.sub("_", name) or "download.bin"      # replace bad chars
+    if len(name) > max_len:
+        # Keep extension if present
+        if "." in name:
+            stem, ext = name.rsplit(".", 1)
+            keep = max(1, max_len - len(ext) - 1)
+            name = (stem[:keep] or "file") + "." + ext
+        else:
+            name = name[:max_len]
+    return name
+
+# ---------- async file iterator ----------
+
 async def _iter_file(path: str, chunk_size: int = 1024 * 1024, on_chunk=None):
+    """Chunked async reader with optional progress callback (sync or async)."""
     loop = asyncio.get_event_loop()
 
     def _read(f, n):
@@ -32,6 +52,7 @@ async def _iter_file(path: str, chunk_size: int = 1024 * 1024, on_chunk=None):
                         pass
             yield chunk
 
+# ---------- client ----------
 
 class GofileClient:
     def __init__(self, token: str, session: Optional[aiohttp.ClientSession] = None):
@@ -74,16 +95,17 @@ class GofileClient:
 
     @staticmethod
     def _extract_usage(info: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        """Return (used_bytes, limit_bytes) if present, else (None, None)."""
         data = info.get("data", info)
 
         traffic = data.get("traffic") or data.get("monthlyTraffic") or data.get("bandwidth")
         if isinstance(traffic, dict):
-            used = traffic.get("used") or traffic.get("current") or traffic.get("value")
+            used  = traffic.get("used") or traffic.get("current") or traffic.get("value")
             limit = traffic.get("limit") or traffic.get("max") or traffic.get("quota")
             if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
                 return int(used), int(limit)
 
-        used = data.get("trafficUsed") or data.get("monthlyTrafficUsed")
+        used  = data.get("trafficUsed") or data.get("monthlyTrafficUsed")
         limit = data.get("trafficLimit") or data.get("monthlyTrafficLimit")
         if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
             return int(used), int(limit)
@@ -110,6 +132,10 @@ class GofileClient:
             params["folderId"] = folder_id
 
         file_size = os.path.getsize(file_path)
+        raw_name  = os.path.basename(file_path)
+        disp_name = _sanitize_filename(raw_name)  # <-- clean display name used in multipart
+
+        # progress state (fix 98.3%: clamp to 99.9% while streaming)
         last = {"t": time.time(), "sent": 0}
 
         def on_chunk(n: int):
@@ -120,22 +146,20 @@ class GofileClient:
             if now - last["t"] >= 1:
                 try:
                     pct = (last["sent"] / file_size * 100) if file_size else 0.0
-                    pct = min(pct, 99.9)  # never show 100% until done
-                    asyncio.create_task(
-                        progress_status.edit(f"⬆️ Uploading… {pct:.1f}%")
-                    )
+                    pct = min(pct, 99.9)  # don't show 100% until server replies
+                    asyncio.create_task(progress_status.edit(f"⬆️ Uploading… {pct:.1f}%"))
                 except Exception:
                     pass
                 last["t"] = now
 
-        # multipart payload
+        # multipart payload (keep file on disk, just set a nice filename in headers)
         mp = MultipartWriter("form-data")
         mp.append(
             payload.AsyncIterablePayload(
                 _iter_file(file_path, 1024 * 1024, on_chunk)  # 1 MB chunks
             ),
             {
-                "Content-Disposition": f'form-data; name="file"; filename="{os.path.basename(file_path)}"'
+                "Content-Disposition": f'form-data; name="file"; filename="{disp_name}"'
             },
         )
 
@@ -143,14 +167,14 @@ class GofileClient:
             UPLOAD_URL, data=mp, params=params, headers=self._headers()
         ) as resp:
             j = await resp.json(content_type=None)
-            if resp.status != 200:
-                return {"error": True, "status": resp.status, "response": j}
-
-            # ✅ one final update at 100%
             if progress_status:
+                # final 100% after server response
                 try:
                     await progress_status.edit("⬆️ Uploading… 100% (processing…)")
                 except Exception:
                     pass
+
+            if resp.status != 200:
+                return {"error": True, "status": resp.status, "response": j}
 
             return j.get("data", j)

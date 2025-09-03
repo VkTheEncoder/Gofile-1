@@ -7,7 +7,11 @@ import random
 import re
 from typing import Tuple, Optional
 from urllib.parse import urlparse, unquote
+from .config import MAX_HTTP_DOWNLOAD_MB, MAX_HTTP_DOWNLOAD_SECONDS
 
+# before starting the loop set defaults if None:
+max_bytes = max_bytes or (MAX_HTTP_DOWNLOAD_MB * 1024 * 1024)
+time_limit = time_limit if (time_limit is not None) else MAX_HTTP_DOWNLOAD_SECONDS
 # Tunables via env (safe defaults)
 PART_SIZE = int(os.getenv("RANGE_PART_SIZE_MB", "8")) * 1024 * 1024  # 8 MB
 MAX_PARTS  = int(os.getenv("RANGE_MAX_PARTS", "6"))

@@ -9,9 +9,6 @@ from typing import Tuple, Optional
 from urllib.parse import urlparse, unquote
 from .config import MAX_HTTP_DOWNLOAD_MB, MAX_HTTP_DOWNLOAD_SECONDS
 
-# before starting the loop set defaults if None:
-max_bytes = max_bytes or (MAX_HTTP_DOWNLOAD_MB * 1024 * 1024)
-time_limit = time_limit if (time_limit is not None) else MAX_HTTP_DOWNLOAD_SECONDS
 # Tunables via env (safe defaults)
 PART_SIZE = int(os.getenv("RANGE_PART_SIZE_MB", "8")) * 1024 * 1024  # 8 MB
 MAX_PARTS  = int(os.getenv("RANGE_MAX_PARTS", "6"))
@@ -111,7 +108,7 @@ async def smart_download(url: str, out_path: str):
       - Parallel range parts for throughput
     """
     limits  = httpx.Limits(max_connections=20, max_keepalive_connections=20)
-    timeout = httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0)
+    timeout = httpx.Timeout(connect=60.0, read=900.0, write=300.0, pool=900.0)
 
     async with httpx.AsyncClient(http2=True, timeout=timeout, limits=limits) as client:
         size, ranged = await _head(url, client)
@@ -143,7 +140,7 @@ async def smart_download(url: str, out_path: str):
                             raise
                         await asyncio.sleep(_rng_delay(attempt))
         else:
-            parts = min(MAX_PARTS, max(1, math.ceil(size / PART_SIZE)))
+            parts = max(1, min(MAX_PARTS, math.ceil(size / PART_SIZE)))
             with open(out_path, "w+b") as fp:
                 fp.truncate(size)  # preallocate contiguous file
                 sem = asyncio.Semaphore(parts)

@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.constants import MessageEntityType
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL
+from .config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, GOFILE_TOKENS, BOT_API_BASE_URL, MAX_CONCURRENT_TRANSFERS
 from .account_pool import AccountPool
 from .handlers import start, help_cmd, stats, handle_incoming_file
 
@@ -39,6 +39,8 @@ def main():
 
     app = builder.build()
     app.bot_data["pool"] = pool  # used by handlers
+
+    app.bot_data["sem"] = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
 
     # 2) URL messages (text or captions) -> same handler
     url_filter = (

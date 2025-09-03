@@ -173,19 +173,36 @@ async def _download_via_pyrogram(update: Update, dest_dir: str, status: _Throttl
     )
 
 def _extract_gofile_result(result: dict) -> tuple[str | None, str | None]:
+    """
+    Be generous: pull link from any of the known keys; if only a code is present,
+    construct https://gofile.io/d/<code>.
+    """
     if not isinstance(result, dict):
         return None, None
     data = result.get("data", result)
+
+    # Prefer explicit link fields
     link = (
         data.get("downloadPage") or data.get("downloadpage") or
         data.get("downloadUrl") or data.get("downloadURL") or
         data.get("page") or data.get("url") or data.get("link") or
         result.get("downloadPage")
     )
-    cid  = (
+
+    # Known ID/code fields
+    code = (
+        data.get("code") or data.get("id") or data.get("fileId") or
+        data.get("contentId") or data.get("cid") or result.get("code")
+    )
+
+    # If no link but we have a code, synthesize the public URL
+    if not link and code:
+        link = f"https://gofile.io/d/{code}"
+
+    cid = (
         data.get("contentId") or data.get("contentID") or
         data.get("fileId") or data.get("id") or data.get("code") or data.get("cid") or
-        result.get("contentId")
+        result.get("contentId") or code
     )
     return link, cid
 

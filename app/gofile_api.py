@@ -1,30 +1,13 @@
 from __future__ import annotations
 
-import os, time, asyncio, inspect, re, json
+import os, time, asyncio, inspect, json
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import unquote
 
 import aiohttp
 from aiohttp import MultipartWriter, payload
 
-API_BASE    = "https://api.gofile.io"
-UPLOAD_URL  = "https://upload.gofile.io/uploadfile"  # global upload endpoint
-
-# ---------- filename normalization ----------
-
-_INVALID = re.compile(r'[\\/:*?"<>|\x00-\x1f]')  # Windows-reserved + control chars
-
-def _sanitize_filename(name: str, max_len: int = 180) -> str:
-    name = unquote(name or "").strip().strip(". ")
-    name = _INVALID.sub("_", name) or "download.bin"
-    if len(name) > max_len:
-        if "." in name:
-            stem, ext = name.rsplit(".", 1)
-            keep = max(1, max_len - len(ext) - 1)
-            name = (stem[:keep] or "file") + "." + ext
-        else:
-            name = name[:max_len]
-    return name
+API_BASE   = "https://api.gofile.io"
+UPLOAD_URL = "https://upload.gofile.io/uploadfile"  # global endpoint, no /getServer
 
 # ---------- async file iterator ----------
 
@@ -69,8 +52,10 @@ class GofileClient:
         if self._owned_session and self.session:
             await self.session.close()
 
+    # ----- account info -----
+
     def _auth_headers(self, as_guest: bool = False) -> Dict[str, str]:
-        # GoFile expects Bearer. For guest uploads, send no auth header.
+        # Bearer token when present; no header for guest uploads
         if as_guest or not self.token:
             return {}
         return {"Authorization": f"Bearer {self.token}"}
@@ -118,30 +103,35 @@ class GofileClient:
             return None
         return (used / limit) >= threshold
 
-    # ---------- helpers ----------
+    # ----- upload helpers -----
 
-    def _normalize_response(self, resp_status: int, raw_text: str, fallback_name: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_response(resp_status: int, raw_text: str, fallback_name: str) -> Dict[str, Any]:
+        """Return a predictable dict with downloadPage/contentId/fileName/error/httpStatus/raw."""
         try:
             j = json.loads(raw_text)
         except Exception:
             j = {"status": "unknown", "raw": raw_text}
 
         data = j.get("data") or j
+
+        # Pull everything we can
+        code = data.get("code") or data.get("id") or data.get("fileId") or data.get("contentId")
         link = (
-            data.get("downloadPage") or data.get("downloadpage")
-            or data.get("downloadUrl") or data.get("downloadURL")
-            or data.get("page") or data.get("url") or data.get("link")
+            data.get("downloadPage") or data.get("downloadpage") or
+            data.get("downloadUrl") or data.get("downloadURL") or
+            data.get("page") or data.get("url") or data.get("link")
         )
-        cid = (
-            data.get("contentId") or data.get("contentID")
-            or data.get("fileId") or data.get("id") or data.get("code") or data.get("cid")
-        )
+        # If only a code exists, build the public page link
+        if not link and code:
+            link = f"https://gofile.io/d/{code}"
+
         fname = data.get("fileName") or data.get("filename") or fallback_name
 
         normalized = {
             "status": (j.get("status") or data.get("status") or ("ok" if resp_status == 200 else "error")).lower(),
             "downloadPage": link,
-            "contentId": cid,
+            "contentId": (data.get("contentId") or data.get("fileId") or code),
             "fileName": fname,
             "raw": j,
         }
@@ -150,15 +140,17 @@ class GofileClient:
             normalized["httpStatus"] = resp_status
         return normalized
 
-    async def _upload_once(self, file_path: str, folder_id: Optional[str], progress_status, as_guest: bool) -> Dict[str, Any]:
+    async def _upload_once(
+        self, file_path: str, folder_id: Optional[str], progress_status, as_guest: bool
+    ) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
-        if folder_id:
-            params["folderId"] = folder_id  # requires auth; omit when guest
+        if folder_id and not as_guest:
+            params["folderId"] = folder_id  # folderId needs auth
 
         file_size = os.path.getsize(file_path)
-        disp_name = _sanitize_filename(os.path.basename(file_path))
+        disp_name = os.path.basename(file_path)  # ← keep EXACT same name the user has
 
-        # progress state — clamp at 99.9% while streaming
+        # live progress (cap at 99.9% until server responds)
         last = {"t": time.time(), "sent": 0}
         def on_chunk(n: int):
             last["sent"] += n
@@ -188,14 +180,15 @@ class GofileClient:
                     await progress_status.edit("⬆️ Uploading… 100% (processing…)")
                 except Exception:
                     pass
-            raw_text = await resp.text()
-            return self._normalize_response(resp.status, raw_text, disp_name)
+            text = await resp.text()
+            return self._normalize_response(resp.status, text, disp_name)
 
-    async def upload_file(self, file_path: str, folder_id: Optional[str] = None, progress_status=None) -> Dict[str, Any]:
-        # 1) try with token
+    async def upload_file(
+        self, file_path: str, folder_id: Optional[str] = None, progress_status=None
+    ) -> Dict[str, Any]:
+        # Try with Bearer token first
         first = await self._upload_once(file_path, folder_id, progress_status, as_guest=False)
-        # 2) if unauthorized/forbidden, retry as guest
+        # If auth fails, retry once as guest
         if first.get("error") and first.get("httpStatus") in (401, 403):
-            second = await self._upload_once(file_path, None, progress_status, as_guest=True)
-            return second
+            return await self._upload_once(file_path, None, progress_status, as_guest=True)
         return first
